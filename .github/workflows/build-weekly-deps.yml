@@ -26,15 +26,12 @@ jobs:
             extra_packages: >-
               chinadns-ng
               dns2socks
-              geoview
               ipt2socks
               microsocks
               naiveproxy
               shadow-tls
-              shadowsocks-rust-sslocal
-              shadowsocks-rust-ssserver
-              shadowsocksr-libev-ssr-local
-              shadowsocksr-libev-ssr-redir
+              shadowsocks-rust
+              shadowsocksr-libev
               simple-obfs
               tcping
               trojan-plus
@@ -53,15 +50,12 @@ jobs:
             extra_packages: >-
               chinadns-ng
               dns2socks
-              geoview
               ipt2socks
               microsocks
               naiveproxy
               shadow-tls
-              shadowsocks-rust-sslocal
-              shadowsocks-rust-ssserver
-              shadowsocksr-libev-ssr-local
-              shadowsocksr-libev-ssr-redir
+              shadowsocks-rust
+              shadowsocksr-libev
               simple-obfs
               tcping
               trojan-plus
