@@ -1,0 +1,210 @@
+name: Build PassWall .run for iStoreOS/OpenWrt 24.10
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: "OpenWrt version"
+        required: true
+        default: "24.10.6"
+      target:
+        description: "OpenWrt target, e.g. x86 / rockchip / ipq40xx"
+        required: true
+        default: "x86"
+      subtarget:
+        description: "OpenWrt subtarget, e.g. 64 / armv8 / generic"
+        required: true
+        default: "64"
+      sdk_arch_suffix:
+        description: "SDK filename suffix, e.g. gcc-13.3.0_musl"
+        required: true
+        default: "gcc-13.3.0_musl"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version }}
+      TARGET: ${{ github.event.inputs.target }}
+      SUBTARGET: ${{ github.event.inputs.subtarget }}
+      SDK_ARCH_SUFFIX: ${{ github.event.inputs.sdk_arch_suffix }}
+
+      # 主包
+      MAIN_PACKAGES: >-
+        luci-app-passwall
+
+      # 尽量多带依赖和常用核心
+      EXTRA_PACKAGES: >-
+        luci-compat
+        luci-base
+        luci-lib-base
+        luci-lib-ip
+        luci-lib-jsonc
+        luci-lib-nixio
+        dns2socks
+        microsocks
+        ipt2socks
+        chinadns-ng
+        tcping
+        geoview
+        xray-core
+        sing-box
+        hysteria
+        tuic-client
+        trojan-plus
+        shadowsocks-rust-sslocal
+        shadowsocks-rust-ssserver
+        shadowsocksr-libev-ssr-local
+        shadowsocksr-libev-ssr-redir
+        shadowsocks-libev-ss-local
+        shadowsocks-libev-ss-redir
+        simple-obfs
+        v2ray-plugin
+        xray-plugin
+        shadow-tls
+        naiveproxy
+        haproxy
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
+            haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+            libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-distutils python3-pip python3-ply python3-docutils qemu-utils \
+            rsync scons squashfs-tools subversion swig texinfo uglifyjs unzip \
+            upx-ucl vim wget xmlto xxd zlib1g-dev zstd makeself jq file ca-certificates
+
+      - name: Prepare variables
+        id: vars
+        shell: bash
+        run: |
+          set -e
+          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}_${SDK_ARCH_SUFFIX}.Linux-x86_64.tar.zst"
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SUBTARGET}/${SDK_FILE}"
+          echo "sdk_file=${SDK_FILE}" >> $GITHUB_OUTPUT
+          echo "sdk_url=${SDK_URL}" >> $GITHUB_OUTPUT
+          echo "release_tag=passwall-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}-$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: Download SDK
+        run: |
+          set -e
+          echo "Downloading: ${{ steps.vars.outputs.sdk_url }}"
+          wget -O "${{ steps.vars.outputs.sdk_file }}" "${{ steps.vars.outputs.sdk_url }}"
+
+      - name: Extract SDK
+        shell: bash
+        run: |
+          set -e
+          tar --zstd -xf "${{ steps.vars.outputs.sdk_file }}"
+          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
+      - name: Update feeds
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          # 先正常更新/安装 feeds
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # 按 PassWall README 的推荐方式，替换 feeds 中旧版本相关包
+          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
+          rm -rf feeds/luci/applications/luci-app-passwall || true
+
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git package/passwall-packages
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall.git package/passwall-luci
+
+      - name: Generate .config
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          cat > .config <<'EOF'
+          CONFIG_ALL_NONSHARED=y
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=y
+          EOF
+
+          for p in $MAIN_PACKAGES $EXTRA_PACKAGES; do
+            echo "CONFIG_PACKAGE_${p}=m" >> .config
+          done
+
+          make defconfig
+
+          echo "===== .config selected packages ====="
+          grep '^CONFIG_PACKAGE_.*=m' .config | sort || true
+
+      - name: Build selected packages
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          PKGS="$MAIN_PACKAGES $EXTRA_PACKAGES"
+
+          for p in $PKGS; do
+            echo "===== Building package/$p ====="
+            make "package/$p/compile" V=s -j"$(nproc)" || \
+            make "package/$p/compile" V=s -j1 || true
+          done
+
+      - name: Collect built IPKs
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "${GITHUB_WORKSPACE}/output/ipk"
+          mkdir -p "${GITHUB_WORKSPACE}/output/logs"
+
+          find bin/packages -type f -name "*.ipk" -print | sort > "${GITHUB_WORKSPACE}/output/logs/all-ipk-list.txt"
+
+          # 直接把本次编出来的 ipk 都带走，简单粗暴但更适合“装上就能用”
+          find bin/packages -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \; || true
+
+          echo "===== Collected IPKs ====="
+          ls -lah "${GITHUB_WORKSPACE}/output/ipk" | tee "${GITHUB_WORKSPACE}/output/logs/collected-ipks.txt"
+
+      - name: Build .run package
+        shell: bash
+        run: |
+          set -e
+          chmod +x scripts/install.sh scripts/make-run.sh
+          bash scripts/make-run.sh \
+            "passwall-full" \
+            "${OPENWRT_VERSION}" \
+            "${TARGET}_${SUBTARGET}" \
+            "${GITHUB_WORKSPACE}/output/ipk"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: passwall-run-${{ env.TARGET }}-${{ env.SUBTARGET }}
+          path: |
+            output/run/*.run
+            output/logs/*
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.release_tag }}
+          files: |
+            output/run/*.run
+            output/logs/*
