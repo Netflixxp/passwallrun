@@ -1,0 +1,194 @@
+name: Build Weekly PassWall Dependencies
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 18 * * 0'
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: "24.10.6"
+
+jobs:
+  build-deps:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            target: x86
+            subtarget: 64
+            sdk_arch_suffix: gcc-13.3.0_musl
+            arch_label: x86_64
+            extra_packages: >-
+              dns2socks
+              geoview
+              ipt2socks
+              microsocks
+              naiveproxy
+              shadow-tls
+              shadowsocks-rust-sslocal
+              shadowsocks-rust-ssserver
+              shadowsocksr-libev-ssr-local
+              shadowsocksr-libev-ssr-redir
+              simple-obfs
+              tcping
+              trojan-plus
+              tuic-client
+              v2ray-geoip
+              v2ray-geosite
+              v2ray-plugin
+              xray-plugin
+
+          - name: aarch64_generic
+            target: rockchip
+            subtarget: armv8
+            sdk_arch_suffix: gcc-13.3.0_musl
+            arch_label: aarch64_generic
+            extra_packages: >-
+              dns2socks
+              geoview
+              ipt2socks
+              microsocks
+              naiveproxy
+              shadow-tls
+              shadowsocks-rust-sslocal
+              shadowsocks-rust-ssserver
+              shadowsocksr-libev-ssr-local
+              shadowsocksr-libev-ssr-redir
+              simple-obfs
+              tcping
+              trojan-plus
+              tuic-client
+              v2ray-geoip
+              v2ray-geosite
+              v2ray-plugin
+              xray-plugin
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
+            haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+            libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-distutils python3-pip python3-ply python3-docutils qemu-utils \
+            rsync scons squashfs-tools subversion swig texinfo uglifyjs unzip \
+            upx-ucl vim wget xmlto xxd zlib1g-dev zstd jq file zip gh ca-certificates
+
+      - name: Prepare SDK variables
+        id: vars
+        shell: bash
+        run: |
+          set -e
+          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${{ matrix.target }}-${{ matrix.subtarget }}_${{ matrix.sdk_arch_suffix }}.Linux-x86_64.tar.zst"
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}/${SDK_FILE}"
+          echo "sdk_file=${SDK_FILE}" >> "$GITHUB_OUTPUT"
+          echo "sdk_url=${SDK_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Download SDK
+        run: |
+          set -e
+          wget -O "${{ steps.vars.outputs.sdk_file }}" "${{ steps.vars.outputs.sdk_url }}"
+
+      - name: Extract SDK
+        shell: bash
+        run: |
+          set -e
+          tar --zstd -xf "${{ steps.vars.outputs.sdk_file }}"
+          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Update feeds and clone PassWall packages
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
+          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git package/passwall-packages
+
+      - name: Generate .config
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+          cat > .config <<'EOF'
+          CONFIG_ALL_NONSHARED=y
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=y
+          EOF
+
+          for p in ${{ matrix.extra_packages }}; do
+            echo "CONFIG_PACKAGE_${p}=m" >> .config
+          done
+
+          make defconfig
+
+      - name: Build packages
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+          FAILED_PKGS=""
+          for p in ${{ matrix.extra_packages }}; do
+            echo "===== Building package/$p ====="
+            if ! make "package/$p/compile" V=s -j"$(nproc)"; then
+              echo "Retrying $p with -j1 ..."
+              if ! make "package/$p/compile" V=s -j1; then
+                echo "FAILED: $p"
+                FAILED_PKGS="$FAILED_PKGS $p"
+              fi
+            fi
+          done
+
+          if [ -n "$FAILED_PKGS" ]; then
+            echo "The following packages failed:$FAILED_PKGS"
+            exit 1
+          fi
+
+      - name: Collect and pack deps
+        working-directory: ${{ env.SDK_DIR }}
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "${GITHUB_WORKSPACE}/dist/${{ matrix.arch_label }}"
+          find bin -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/dist/${{ matrix.arch_label }}/" \;
+          cd "${GITHUB_WORKSPACE}/dist/${{ matrix.arch_label }}"
+          zip -r "../deps-weekly-${{ matrix.arch_label }}.zip" ./*.ipk
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deps-weekly-${{ matrix.arch_label }}
+          path: dist/deps-weekly-${{ matrix.arch_label }}.zip
+
+  release:
+    needs: build-deps
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-dist
+
+      - name: Create or update weekly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: weekly-deps
+          name: Weekly Dependencies
+          files: release-dist/**/*.zip
