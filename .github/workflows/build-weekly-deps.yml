@@ -28,18 +28,8 @@ jobs:
               dns2socks
               ipt2socks
               microsocks
-              naiveproxy
-              shadow-tls
-              shadowsocks-rust
-              shadowsocksr-libev
               simple-obfs
               tcping
-              trojan-plus
-              tuic-client
-              v2ray-geoip
-              v2ray-geosite
-              v2ray-plugin
-              xray-plugin
               hysteria
 
           - name: aarch64_generic
@@ -51,20 +41,11 @@ jobs:
               chinadns-ng
               dns2socks
               ipt2socks
-              microsocks
-              naiveproxy
-              shadow-tls
-              shadowsocks-rust
-              shadowsocksr-libev
               simple-obfs
               tcping
-              trojan-plus
-              tuic-client
-              v2ray-geoip
-              v2ray-geosite
               v2ray-plugin
-              xray-plugin
               hysteria
+              tcping
 
     steps:
       - name: Checkout current repo
