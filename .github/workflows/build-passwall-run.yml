@@ -31,18 +31,12 @@ jobs:
           FORCE_BUILD: ${{ github.event.inputs.force_build }}
         run: |
           set -e
-
           PASSWALL_VERSION="$(gh api repos/Openwrt-Passwall/openwrt-passwall/releases/latest --jq '.tag_name')"
           RELEASE_TAG="build-${PASSWALL_VERSION}"
 
-          echo "Latest PassWall version: ${PASSWALL_VERSION}"
-          echo "Release tag to use: ${RELEASE_TAG}"
-
           BUILD_NEEDED="true"
-
           if [ "${FORCE_BUILD}" != "true" ]; then
             if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-              echo "This version is already built in current repo: ${RELEASE_TAG}"
               BUILD_NEEDED="false"
             fi
           fi
@@ -64,64 +58,20 @@ jobs:
             subtarget: 64
             sdk_arch_suffix: gcc-13.3.0_musl
             arch_label: x86_64
-            extra_packages: >-
-              luci-compat
-              luci-base
-              luci-lib-base
-              luci-lib-ip
-              luci-lib-jsonc
-              luci-lib-nixio
-              dns2socks
-              microsocks
-              ipt2socks
+            hot_packages: >-
               chinadns-ng
-              tcping
-              geoview
               xray-core
               sing-box
               hysteria
-              tuic-client
-              trojan-plus
-              shadowsocks-rust-sslocal
-              shadowsocks-rust-ssserver
-              shadowsocksr-libev-ssr-local
-              shadowsocksr-libev-ssr-redir
-              shadowsocks-libev-ss-local
-              shadowsocks-libev-ss-redir
-              simple-obfs
-              v2ray-plugin
-              xray-plugin
-              shadow-tls
-              naiveproxy
-              haproxy
 
           - name: aarch64_generic
             target: rockchip
             subtarget: armv8
             sdk_arch_suffix: gcc-13.3.0_musl
             arch_label: aarch64_generic
-            extra_packages: >-
+            hot_packages: >-
               chinadns-ng
-              dns2socks
-              geoview
-              ipt2socks
-              microsocks
-              naiveproxy
-              shadow-tls
-              shadowsocks-rust-sslocal
-              shadowsocks-rust-ssserver
-              shadowsocksr-libev-ssr-local
-              shadowsocksr-libev-ssr-redir
-              shadowsocksr-libev-ssr-server
-              simple-obfs
-              tcping
-              trojan-plus
-              tuic-client
-              v2ray-geoip
-              v2ray-geosite
-              v2ray-plugin
               xray-core
-              xray-plugin
               sing-box
               hysteria
 
@@ -129,12 +79,13 @@ jobs:
       PASSWALL_VERSION: ${{ needs.check-update.outputs.passwall_version }}
       MAIN_PACKAGES: >-
         luci-app-passwall
+        luci-i18n-passwall-zh-cn
 
     steps:
       - name: Checkout current repo
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -147,7 +98,7 @@ jobs:
             lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
             python3-distutils python3-pip python3-ply python3-docutils qemu-utils \
             rsync scons squashfs-tools subversion swig texinfo uglifyjs unzip \
-            upx-ucl vim wget xmlto xxd zlib1g-dev zstd makeself jq file ca-certificates gh
+            upx-ucl vim wget xmlto xxd zlib1g-dev zstd jq file gh makeself zip ca-certificates
 
       - name: Prepare SDK variables
         id: vars
@@ -156,14 +107,12 @@ jobs:
           set -e
           SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${{ matrix.target }}-${{ matrix.subtarget }}_${{ matrix.sdk_arch_suffix }}.Linux-x86_64.tar.zst"
           SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}/${SDK_FILE}"
-
           echo "sdk_file=${SDK_FILE}" >> "$GITHUB_OUTPUT"
           echo "sdk_url=${SDK_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Download SDK
         run: |
           set -e
-          echo "Downloading SDK: ${{ steps.vars.outputs.sdk_url }}"
           wget -O "${{ steps.vars.outputs.sdk_file }}" "${{ steps.vars.outputs.sdk_url }}"
 
       - name: Extract SDK
@@ -179,11 +128,10 @@ jobs:
         shell: bash
         run: |
           set -e
-
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,simple-obfs-client,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
+          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
           rm -rf feeds/luci/applications/luci-app-passwall || true
 
           git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git package/passwall-packages
@@ -194,7 +142,6 @@ jobs:
         shell: bash
         run: |
           set -e
-
           cat > .config <<'EOF'
           CONFIG_ALL_NONSHARED=y
           CONFIG_ALL_KMODS=n
@@ -202,28 +149,22 @@ jobs:
           CONFIG_AUTOREMOVE=y
           EOF
 
-          for p in $MAIN_PACKAGES ${{ matrix.extra_packages }}; do
+          for p in $MAIN_PACKAGES ${{ matrix.hot_packages }}; do
             echo "CONFIG_PACKAGE_${p}=m" >> .config
           done
 
           make defconfig
 
-          echo "===== Selected packages ====="
-          grep '^CONFIG_PACKAGE_.*=m' .config | sort || true
-
-      - name: Build packages
+      - name: Build hot packages
         working-directory: ${{ env.SDK_DIR }}
         shell: bash
         run: |
           set -e
-
-          PKGS="$MAIN_PACKAGES ${{ matrix.extra_packages }}"
           FAILED_PKGS=""
-
-          for p in $PKGS; do
+          for p in $MAIN_PACKAGES ${{ matrix.hot_packages }}; do
             echo "===== Building package/$p ====="
             if ! make "package/$p/compile" V=s -j"$(nproc)"; then
-              echo "Parallel build failed for $p, retrying with -j1..."
+              echo "Retrying $p with -j1 ..."
               if ! make "package/$p/compile" V=s -j1; then
                 echo "FAILED: $p"
                 FAILED_PKGS="$FAILED_PKGS $p"
@@ -236,37 +177,29 @@ jobs:
             exit 1
           fi
 
-      - name: Collect built IPKs
+      - name: Download weekly deps zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p weekly
+          gh release download weekly-deps --pattern "deps-weekly-${{ matrix.arch_label }}.zip" --dir weekly
+
+      - name: Collect hot packages and merge deps
         working-directory: ${{ env.SDK_DIR }}
         shell: bash
         run: |
           set -e
           mkdir -p "${GITHUB_WORKSPACE}/output/ipk"
-          mkdir -p "${GITHUB_WORKSPACE}/output/logs"
-
-          if [ ! -d "bin" ]; then
-            echo "ERROR: build output directory 'bin' does not exist"
-            exit 1
-          fi
-
-          find bin -type f -name "*.ipk" | sort > "${GITHUB_WORKSPACE}/output/logs/all-ipk-list-${{ matrix.arch_label }}.txt" || true
-
-          if [ ! -s "${GITHUB_WORKSPACE}/output/logs/all-ipk-list-${{ matrix.arch_label }}.txt" ]; then
-            echo "ERROR: no ipk files were generated"
-            find bin -maxdepth 3 -type d | sort || true
-            exit 1
-          fi
-
           find bin -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \;
 
-          ls -lah "${GITHUB_WORKSPACE}/output/ipk" | tee "${GITHUB_WORKSPACE}/output/logs/collected-ipks-${{ matrix.arch_label }}.txt"
+          unzip -o "${GITHUB_WORKSPACE}/weekly/deps-weekly-${{ matrix.arch_label }}.zip" -d "${GITHUB_WORKSPACE}/output/ipk"
 
       - name: Make .run package
         shell: bash
         run: |
           set -e
           chmod +x scripts/install.sh scripts/make-run.sh
-
           bash scripts/make-run.sh \
             "passwall-full" \
             "${OPENWRT_VERSION}" \
@@ -274,13 +207,11 @@ jobs:
             "${PASSWALL_VERSION}" \
             "${GITHUB_WORKSPACE}/output/ipk"
 
-      - name: Upload build artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: passwall-${{ matrix.arch_label }}
-          path: |
-            output/run/*.run
-            output/logs/*
+          path: output/run/*.run
 
   release:
     needs:
@@ -289,16 +220,12 @@ jobs:
     if: needs.check-update.outputs.build_needed == 'true'
     runs-on: ubuntu-22.04
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: Show files
-        run: |
-          find dist -type f | sort
-
-      - name: Create GitHub Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-update.outputs.release_tag }}
