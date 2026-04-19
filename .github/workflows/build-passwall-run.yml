@@ -8,8 +8,7 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: '17 3 * * *'
-      timezone: 'Asia/Shanghai'
+    - cron: '17 19 * * *'
 
 permissions:
   contents: write
@@ -65,49 +64,70 @@ jobs:
             subtarget: 64
             sdk_arch_suffix: gcc-13.3.0_musl
             arch_label: x86_64
+            extra_packages: >-
+              luci-compat
+              luci-base
+              luci-lib-base
+              luci-lib-ip
+              luci-lib-jsonc
+              luci-lib-nixio
+              dns2socks
+              microsocks
+              ipt2socks
+              chinadns-ng
+              tcping
+              geoview
+              xray-core
+              sing-box
+              hysteria
+              tuic-client
+              trojan-plus
+              shadowsocks-rust-sslocal
+              shadowsocks-rust-ssserver
+              shadowsocksr-libev-ssr-local
+              shadowsocksr-libev-ssr-redir
+              shadowsocks-libev-ss-local
+              shadowsocks-libev-ss-redir
+              simple-obfs
+              v2ray-plugin
+              xray-plugin
+              shadow-tls
+              naiveproxy
+              haproxy
 
           - name: aarch64_generic
             target: rockchip
             subtarget: armv8
             sdk_arch_suffix: gcc-13.3.0_musl
             arch_label: aarch64_generic
+            extra_packages: >-
+              chinadns-ng
+              dns2socks
+              geoview
+              ipt2socks
+              microsocks
+              naiveproxy
+              shadow-tls
+              shadowsocks-rust-sslocal
+              shadowsocks-rust-ssserver
+              shadowsocksr-libev-ssr-local
+              shadowsocksr-libev-ssr-redir
+              shadowsocksr-libev-ssr-server
+              simple-obfs
+              tcping
+              trojan-plus
+              tuic-client
+              v2ray-geoip
+              v2ray-geosite
+              v2ray-plugin
+              xray-core
+              xray-plugin
+              sing-box
 
     env:
       PASSWALL_VERSION: ${{ needs.check-update.outputs.passwall_version }}
-
       MAIN_PACKAGES: >-
         luci-app-passwall
-
-      EXTRA_PACKAGES: >-
-        luci-compat
-        luci-base
-        luci-lib-base
-        luci-lib-ip
-        luci-lib-jsonc
-        luci-lib-nixio
-        dns2socks
-        microsocks
-        ipt2socks
-        chinadns-ng
-        tcping
-        geoview
-        xray-core
-        sing-box
-        hysteria
-        tuic-client
-        trojan-plus
-        shadowsocks-rust-sslocal
-        shadowsocks-rust-ssserver
-        shadowsocksr-libev-ssr-local
-        shadowsocksr-libev-ssr-redir
-        shadowsocks-libev-ss-local
-        shadowsocks-libev-ss-redir
-        simple-obfs
-        v2ray-plugin
-        xray-plugin
-        shadow-tls
-        naiveproxy
-        haproxy
 
     steps:
       - name: Checkout current repo
@@ -162,7 +182,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
+          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,simple-obfs-client,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
           rm -rf feeds/luci/applications/luci-app-passwall || true
 
           git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git package/passwall-packages
@@ -181,7 +201,7 @@ jobs:
           CONFIG_AUTOREMOVE=y
           EOF
 
-          for p in $MAIN_PACKAGES $EXTRA_PACKAGES; do
+          for p in $MAIN_PACKAGES ${{ matrix.extra_packages }}; do
             echo "CONFIG_PACKAGE_${p}=m" >> .config
           done
 
@@ -196,13 +216,24 @@ jobs:
         run: |
           set -e
 
-          PKGS="$MAIN_PACKAGES $EXTRA_PACKAGES"
+          PKGS="$MAIN_PACKAGES ${{ matrix.extra_packages }}"
+          FAILED_PKGS=""
 
           for p in $PKGS; do
             echo "===== Building package/$p ====="
-            make "package/$p/compile" V=s -j"$(nproc)" || \
-            make "package/$p/compile" V=s -j1 || true
+            if ! make "package/$p/compile" V=s -j"$(nproc)"; then
+              echo "Parallel build failed for $p, retrying with -j1..."
+              if ! make "package/$p/compile" V=s -j1; then
+                echo "FAILED: $p"
+                FAILED_PKGS="$FAILED_PKGS $p"
+              fi
+            fi
           done
+
+          if [ -n "$FAILED_PKGS" ]; then
+            echo "The following packages failed:$FAILED_PKGS"
+            exit 1
+          fi
 
       - name: Collect built IPKs
         working-directory: ${{ env.SDK_DIR }}
@@ -212,8 +243,20 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/output/ipk"
           mkdir -p "${GITHUB_WORKSPACE}/output/logs"
 
-          find bin/packages -type f -name "*.ipk" | sort > "${GITHUB_WORKSPACE}/output/logs/all-ipk-list-${{ matrix.arch_label }}.txt"
-          find bin/packages -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \; || true
+          if [ ! -d "bin" ]; then
+            echo "ERROR: build output directory 'bin' does not exist"
+            exit 1
+          fi
+
+          find bin -type f -name "*.ipk" | sort > "${GITHUB_WORKSPACE}/output/logs/all-ipk-list-${{ matrix.arch_label }}.txt" || true
+
+          if [ ! -s "${GITHUB_WORKSPACE}/output/logs/all-ipk-list-${{ matrix.arch_label }}.txt" ]; then
+            echo "ERROR: no ipk files were generated"
+            find bin -maxdepth 3 -type d | sort || true
+            exit 1
+          fi
+
+          find bin -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \;
 
           ls -lah "${GITHUB_WORKSPACE}/output/ipk" | tee "${GITHUB_WORKSPACE}/output/logs/collected-ipks-${{ matrix.arch_label }}.txt"
 
