@@ -1,43 +1,83 @@
-name: Build PassWall .run for iStoreOS/OpenWrt 24.10
+name: Build PassWall .run
 
 on:
   workflow_dispatch:
     inputs:
-      openwrt_version:
-        description: "OpenWrt version"
-        required: true
-        default: "24.10.6"
-      target:
-        description: "OpenWrt target, e.g. x86 / rockchip / ipq40xx"
-        required: true
-        default: "x86"
-      subtarget:
-        description: "OpenWrt subtarget, e.g. 64 / armv8 / generic"
-        required: true
-        default: "64"
-      sdk_arch_suffix:
-        description: "SDK filename suffix, e.g. gcc-13.3.0_musl"
-        required: true
-        default: "gcc-13.3.0_musl"
+      force_build:
+        description: "Force build even if current PassWall version is already built"
+        required: false
+        default: "false"
+  schedule:
+    - cron: '17 3 * * *'
+      timezone: 'Asia/Shanghai'
 
 permissions:
   contents: write
 
+env:
+  OPENWRT_VERSION: "24.10.6"
+
 jobs:
-  build:
+  check-update:
     runs-on: ubuntu-22.04
+    outputs:
+      build_needed: ${{ steps.check.outputs.build_needed }}
+      passwall_version: ${{ steps.check.outputs.passwall_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Check latest PassWall version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
+        run: |
+          set -e
+
+          PASSWALL_VERSION="$(gh api repos/Openwrt-Passwall/openwrt-passwall/releases/latest --jq '.tag_name')"
+          RELEASE_TAG="build-${PASSWALL_VERSION}"
+
+          echo "Latest PassWall version: ${PASSWALL_VERSION}"
+          echo "Release tag to use: ${RELEASE_TAG}"
+
+          BUILD_NEEDED="true"
+
+          if [ "${FORCE_BUILD}" != "true" ]; then
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              echo "This version is already built in current repo: ${RELEASE_TAG}"
+              BUILD_NEEDED="false"
+            fi
+          fi
+
+          echo "passwall_version=${PASSWALL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-update
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            target: x86
+            subtarget: 64
+            sdk_arch_suffix: gcc-13.3.0_musl
+            arch_label: x86_64
+
+          - name: aarch64_generic
+            target: rockchip
+            subtarget: armv8
+            sdk_arch_suffix: gcc-13.3.0_musl
+            arch_label: aarch64_generic
 
     env:
-      OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version }}
-      TARGET: ${{ github.event.inputs.target }}
-      SUBTARGET: ${{ github.event.inputs.subtarget }}
-      SDK_ARCH_SUFFIX: ${{ github.event.inputs.sdk_arch_suffix }}
+      PASSWALL_VERSION: ${{ needs.check-update.outputs.passwall_version }}
 
-      # 主包
       MAIN_PACKAGES: >-
         luci-app-passwall
 
-      # 尽量多带依赖和常用核心
       EXTRA_PACKAGES: >-
         luci-compat
         luci-base
@@ -86,23 +126,23 @@ jobs:
             lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
             python3-distutils python3-pip python3-ply python3-docutils qemu-utils \
             rsync scons squashfs-tools subversion swig texinfo uglifyjs unzip \
-            upx-ucl vim wget xmlto xxd zlib1g-dev zstd makeself jq file ca-certificates
+            upx-ucl vim wget xmlto xxd zlib1g-dev zstd makeself jq file ca-certificates gh
 
-      - name: Prepare variables
+      - name: Prepare SDK variables
         id: vars
         shell: bash
         run: |
           set -e
-          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}_${SDK_ARCH_SUFFIX}.Linux-x86_64.tar.zst"
-          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SUBTARGET}/${SDK_FILE}"
-          echo "sdk_file=${SDK_FILE}" >> $GITHUB_OUTPUT
-          echo "sdk_url=${SDK_URL}" >> $GITHUB_OUTPUT
-          echo "release_tag=passwall-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}-$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${{ matrix.target }}-${{ matrix.subtarget }}_${{ matrix.sdk_arch_suffix }}.Linux-x86_64.tar.zst"
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}/${SDK_FILE}"
+
+          echo "sdk_file=${SDK_FILE}" >> "$GITHUB_OUTPUT"
+          echo "sdk_url=${SDK_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Download SDK
         run: |
           set -e
-          echo "Downloading: ${{ steps.vars.outputs.sdk_url }}"
+          echo "Downloading SDK: ${{ steps.vars.outputs.sdk_url }}"
           wget -O "${{ steps.vars.outputs.sdk_file }}" "${{ steps.vars.outputs.sdk_url }}"
 
       - name: Extract SDK
@@ -111,19 +151,17 @@ jobs:
           set -e
           tar --zstd -xf "${{ steps.vars.outputs.sdk_file }}"
           SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
-          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Update feeds
+      - name: Update feeds and clone PassWall sources
         working-directory: ${{ env.SDK_DIR }}
         shell: bash
         run: |
           set -e
 
-          # 先正常更新/安装 feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 按 PassWall README 的推荐方式，替换 feeds 中旧版本相关包
           rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
           rm -rf feeds/luci/applications/luci-app-passwall || true
 
@@ -149,10 +187,10 @@ jobs:
 
           make defconfig
 
-          echo "===== .config selected packages ====="
+          echo "===== Selected packages ====="
           grep '^CONFIG_PACKAGE_.*=m' .config | sort || true
 
-      - name: Build selected packages
+      - name: Build packages
         working-directory: ${{ env.SDK_DIR }}
         shell: bash
         run: |
@@ -174,37 +212,51 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/output/ipk"
           mkdir -p "${GITHUB_WORKSPACE}/output/logs"
 
-          find bin/packages -type f -name "*.ipk" -print | sort > "${GITHUB_WORKSPACE}/output/logs/all-ipk-list.txt"
-
-          # 直接把本次编出来的 ipk 都带走，简单粗暴但更适合“装上就能用”
+          find bin/packages -type f -name "*.ipk" | sort > "${GITHUB_WORKSPACE}/output/logs/all-ipk-list-${{ matrix.arch_label }}.txt"
           find bin/packages -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \; || true
 
-          echo "===== Collected IPKs ====="
-          ls -lah "${GITHUB_WORKSPACE}/output/ipk" | tee "${GITHUB_WORKSPACE}/output/logs/collected-ipks.txt"
+          ls -lah "${GITHUB_WORKSPACE}/output/ipk" | tee "${GITHUB_WORKSPACE}/output/logs/collected-ipks-${{ matrix.arch_label }}.txt"
 
-      - name: Build .run package
+      - name: Make .run package
         shell: bash
         run: |
           set -e
           chmod +x scripts/install.sh scripts/make-run.sh
+
           bash scripts/make-run.sh \
             "passwall-full" \
             "${OPENWRT_VERSION}" \
-            "${TARGET}_${SUBTARGET}" \
+            "${{ matrix.arch_label }}" \
+            "${PASSWALL_VERSION}" \
             "${GITHUB_WORKSPACE}/output/ipk"
 
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: passwall-run-${{ env.TARGET }}-${{ env.SUBTARGET }}
+          name: passwall-${{ matrix.arch_label }}
           path: |
             output/run/*.run
             output/logs/*
 
-      - name: Create Release
+  release:
+    needs:
+      - check-update
+      - build
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show files
+        run: |
+          find dist -type f | sort
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.vars.outputs.release_tag }}
-          files: |
-            output/run/*.run
-            output/logs/*
+          tag_name: ${{ needs.check-update.outputs.release_tag }}
+          name: PassWall ${{ needs.check-update.outputs.passwall_version }}
+          files: dist/**/*.run
