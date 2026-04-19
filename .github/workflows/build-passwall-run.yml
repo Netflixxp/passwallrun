@@ -123,6 +123,7 @@ jobs:
               xray-core
               xray-plugin
               sing-box
+              hysteria
 
     env:
       PASSWALL_VERSION: ${{ needs.check-update.outputs.passwall_version }}
