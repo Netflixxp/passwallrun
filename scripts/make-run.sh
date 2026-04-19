@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_NAME="${1:-passwall-full}"
-OPENWRT_VERSION="${2:-24.10.6}"
-ARCH_LABEL="${3:-x86_64}"
-PASSWALL_VERSION="${4:-unknown}"
-IPK_SOURCE_DIR="${5:-./output/ipk}"
+PACKAGE_NAME="${1:?missing package name}"
+OPENWRT_VERSION="${2:?missing openwrt version}"
+ARCH_LABEL="${3:?missing arch label}"
+PASSWALL_VERSION="${4:?missing passwall version}"
+IPK_SOURCE_DIR="${5:?missing ipk source dir}"
 
 WORKDIR="$(pwd)"
 BUILD_DIR="${WORKDIR}/output/build-run"
