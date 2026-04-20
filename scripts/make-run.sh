@@ -14,7 +14,16 @@ RUN_DIR="${WORKDIR}/output/run"
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}/ipk" "${RUN_DIR}"
 
-cp -av "${IPK_SOURCE_DIR}/"*.ipk "${BUILD_DIR}/ipk/" 2>/dev/null || true
+shopt -s nullglob
+ipk_files=("${IPK_SOURCE_DIR}"/*.ipk)
+shopt -u nullglob
+
+if [ ${#ipk_files[@]} -eq 0 ]; then
+  echo "ERROR: no .ipk files found in ${IPK_SOURCE_DIR}"
+  exit 1
+fi
+
+cp -av "${ipk_files[@]}" "${BUILD_DIR}/ipk/"
 cp -av "${WORKDIR}/scripts/install.sh" "${BUILD_DIR}/install.sh"
 chmod +x "${BUILD_DIR}/install.sh"
 
