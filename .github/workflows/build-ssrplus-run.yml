@@ -1,4 +1,4 @@
-name: Build SSR Plus .run
+name: Build SSR Plus .run from dl.openwrt.ai
 
 on:
   workflow_dispatch:
@@ -7,16 +7,14 @@ on:
         description: "Force build even if current SSR Plus version is already built"
         required: false
         default: "false"
-      package_version:
-        description: "Package directory version"
-        required: false
-        default: "packages-24.10"
+  schedule:
+    - cron: '37 19 * * *'
 
 permissions:
   contents: write
 
 env:
-  PACKAGE_VERSION: "packages-24.10"
+  OPENWRT_VERSION: "24.10"
 
 jobs:
   check-update:
@@ -25,7 +23,6 @@ jobs:
       build_needed: ${{ steps.check.outputs.build_needed }}
       ssrplus_version: ${{ steps.check.outputs.ssrplus_version }}
       release_tag: ${{ steps.check.outputs.release_tag }}
-      package_version: ${{ steps.check.outputs.package_version }}
     steps:
       - name: Check latest helloworld commit
         id: check
@@ -34,11 +31,6 @@ jobs:
           FORCE_BUILD: ${{ github.event.inputs.force_build }}
         run: |
           set -euo pipefail
-
-          PACKAGE_VERSION="${{ github.event.inputs.package_version }}"
-          if [ -z "${PACKAGE_VERSION}" ]; then
-            PACKAGE_VERSION="packages-24.10"
-          fi
 
           SSRPLUS_VERSION="$(gh api repos/fw876/helloworld/commits/master --jq '.sha' | cut -c1-7)"
           RELEASE_TAG="build-ssrplus-${SSRPLUS_VERSION}"
@@ -53,7 +45,6 @@ jobs:
           echo "ssrplus_version=${SSRPLUS_VERSION}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
-          echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check-update
@@ -70,7 +61,6 @@ jobs:
 
     env:
       SSRPLUS_VERSION: ${{ needs.check-update.outputs.ssrplus_version }}
-      PACKAGE_VERSION: ${{ needs.check-update.outputs.package_version }}
 
     steps:
       - name: Checkout current repo
@@ -79,146 +69,131 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl wget jq gzip makeself gh ca-certificates
+          sudo apt-get install -y \
+            curl wget jq gzip makeself gh ca-certificates
 
       - name: Prepare directories
         run: |
           set -euo pipefail
-          rm -rf output tmp work
-          mkdir -p output/ipk output/run tmp work/depends
+          rm -rf output tmp
+          mkdir -p output/ipk output/run tmp
 
-      - name: Download prebuilt ipks from dl.openwrt.ai
+      - name: Download package indexes from dl.openwrt.ai
         run: |
           set -euo pipefail
 
-          K_BASE="${{ matrix.base_url }}/kiddin9/"
-          P_BASE="${{ matrix.base_url }}/packages/"
+          K_BASE_URL="${{ matrix.base_url }}/kiddin9"
+          P_BASE_URL="${{ matrix.base_url }}/packages"
 
-          FILE_PREFIXES=(
-            "shadowsocks-libev-ss-server"
-            "dns2tcp"
-            "lua-neturl"
-            "chinadns-ng"
-            "dns2socks"
-            "hysteria"
-            "ipt2socks"
-            "microsocks"
-            "mosdns"
-            "naiveproxy"
-            "redsocks2"
-            "shadowsocksr-libev"
-            "shadowsocks-rust"
-            "shadow-tls"
-            "simple-obfs-client"
-            "tcping"
-            "trojan"
-            "tuic-client"
-            "v2ray-plugin"
-            "xray-core"
-            "luci-app-ssr-plus"
-          )
-
-          EXCLUDE_PREFIXES=(
-            "luci-app-chinadns-ng"
-            "luci-app-microsocks"
-            "luci-app-mosdns"
-            "luci-app-naiveproxy"
-            "luci-app-redsocks2"
-            "luci-app-shadowsocks"
-            "luci-app-trojan-server"
-          )
-
-          download_from_dir() {
-            local base_url="$1"
-            local out_dir="$2"
-
-            wget -qO- "$base_url" | while IFS= read -r line; do
-              for prefix in "${FILE_PREFIXES[@]}"; do
-                if [[ "$line" == *"$prefix"* ]]; then
-                  file=$(echo "$line" | grep -oP 'href="\K[^"]*' || true)
-                  if [[ -z "${file:-}" ]]; then
-                    continue
-                  fi
-
-                  exclude_file=false
-                  for exclude_prefix in "${EXCLUDE_PREFIXES[@]}"; do
-                    if [[ "$file" == $exclude_prefix* ]]; then
-                      exclude_file=true
-                      break
-                    fi
-                  done
-
-                  if $exclude_file; then
-                    continue
-                  fi
-
-                  file_url="${base_url}${file}"
-                  echo "Downloading: $file_url"
-                  curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
-                    "$file_url" -o "${out_dir}/$(basename "$file_url")"
-                fi
-              done
-            done
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
           }
 
-          download_from_packages_dir() {
-            local base_url="$1"
-            local out_dir="$2"
+          download_with_retry "${K_BASE_URL}/Packages.gz" "tmp/Kiddin9-Packages.gz"
+          download_with_retry "${P_BASE_URL}/Packages.gz" "tmp/Packages-Packages.gz"
 
-            wget -qO- "$base_url" | while IFS= read -r line; do
-              if [[ "$line" == *"libudns"* ]]; then
-                file=$(echo "$line" | grep -oP 'href="\K[^"]*' || true)
-                if [[ -z "${file:-}" ]]; then
-                  continue
-                fi
+          gunzip -c tmp/Kiddin9-Packages.gz > tmp/Kiddin9-Packages
+          gunzip -c tmp/Packages-Packages.gz > tmp/Packages-Packages
 
-                file_url="${base_url}${file}"
-                echo "Downloading: $file_url"
-                curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
-                  "$file_url" -o "${out_dir}/$(basename "$file_url")"
-              fi
-            done
+      - name: Save package indexes
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssrplus-indexes-${{ matrix.arch_label }}
+          path: |
+            tmp/Kiddin9-Packages
+            tmp/Packages-Packages
+
+      - name: Download SSR Plus ipks from kiddin9 and packages
+        run: |
+          set -euo pipefail
+
+          K_BASE_URL="${{ matrix.base_url }}/kiddin9"
+          P_BASE_URL="${{ matrix.base_url }}/packages"
+
+          K_PKGS=(
+            luci-app-ssr-plus
+            lua-neturl
+            chinadns-ng
+            dns2socks
+            hysteria
+            ipt2socks
+            microsocks
+            mosdns
+            naiveproxy
+            redsocks2
+            shadowsocks-libev-ss-server
+            shadowsocks-rust-sslocal
+            shadowsocks-rust-ssserver
+            shadowsocksr-libev-ssr-check
+            shadowsocksr-libev-ssr-local
+            shadowsocksr-libev-ssr-redir
+            shadow-tls
+            simple-obfs-client
+            tcping
+            trojan
+            tuic-client
+            v2ray-plugin
+            xray-core
+          )
+
+          P_PKGS=(
+            libudns
+          )
+
+          awk_get_filename() {
+            local pkg="$1"
+            local index="$2"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /)  p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' "$index"
           }
 
-          download_from_dir "$K_BASE" "work/depends"
-          download_from_packages_dir "$P_BASE" "work/depends"
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
 
-      - name: Organize SSR Plus package files
-        run: |
-          set -euo pipefail
+          for pkg in "${K_PKGS[@]}"; do
+            filename="$(awk_get_filename "$pkg" tmp/Kiddin9-Packages || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in kiddin9 index: $pkg"
+              exit 1
+            fi
 
-          mv work/depends/luci-app-ssr-plus*.ipk work/ || true
+            echo "Downloading $filename"
+            download_with_retry \
+              "${K_BASE_URL}/$(basename "$filename")" \
+              "output/ipk/$(basename "$filename")"
+          done
 
-          shopt -s nullglob
-          root_files=(work/luci-app-ssr-plus*.ipk)
-          dep_files=(work/depends/*.ipk)
-          shopt -u nullglob
+          for pkg in "${P_PKGS[@]}"; do
+            filename="$(awk_get_filename "$pkg" tmp/Packages-Packages || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in packages index: $pkg"
+              exit 1
+            fi
 
-          if [ ${#root_files[@]} -eq 0 ]; then
-            echo "ERROR: luci-app-ssr-plus ipk not found"
-            exit 1
-          fi
-
-          if [ ${#dep_files[@]} -eq 0 ]; then
-            echo "ERROR: dependency ipks not found"
-            exit 1
-          fi
-
-          cp -av work/depends/*.ipk output/ipk/
-          cp -av work/luci-app-ssr-plus*.ipk output/ipk/
-
-      - name: Parse version from luci-app-ssr-plus filename
-        id: parse_version
-        run: |
-          set -euo pipefail
-
-          file="$(basename "$(ls output/ipk/luci-app-ssr-plus*.ipk | head -n 1)")"
-          tmp="${file#*_}"
-          tmp="${tmp%_all.ipk}"
-          ssrp_version="${tmp//-/_}"
-
-          echo "ssrp_version=${ssrp_version}" >> "$GITHUB_OUTPUT"
-          echo "Parsed SSR Plus package version: ${ssrp_version}"
+            echo "Downloading $filename"
+            download_with_retry \
+              "${P_BASE_URL}/$(basename "$filename")" \
+              "output/ipk/$(basename "$filename")"
+          done
 
       - name: Verify required packages
         run: |
@@ -243,52 +218,34 @@ jobs:
             fi
           done
 
-      - name: Create install.sh for SSR Plus
+      - name: Show downloaded files
+        run: |
+          ls -lah output/ipk
+
+      - name: Parse SSR Plus package version
+        id: parse_version
         run: |
           set -euo pipefail
 
-          cat > output/install.sh <<'EOF'
-          #!/bin/sh
-          set -e
+          file="$(basename "$(ls output/ipk/luci-app-ssr-plus*.ipk | head -n 1)")"
+          tmp="${file#*_}"
+          tmp="${tmp%_all.ipk}"
+          ssrp_pkg_version="${tmp//-/_}"
 
-          opkg update || true
-
-          if ls /tmp/ssrplus_pkg/depends/*.ipk >/dev/null 2>&1; then
-            opkg install /tmp/ssrplus_pkg/depends/*.ipk --force-depends || true
-          fi
-
-          if ls /tmp/ssrplus_pkg/*.ipk >/dev/null 2>&1; then
-            opkg install /tmp/ssrplus_pkg/*.ipk --force-depends || true
-          fi
-
-          echo "SSR Plus install finished."
-          EOF
-
-          chmod +x output/install.sh
-
-      - name: Prepare files for makeself
-        run: |
-          set -euo pipefail
-
-          rm -rf output/build-run
-          mkdir -p output/build-run/depends
-
-          cp -av output/ipk/luci-app-ssr-plus*.ipk output/build-run/
-          find output/ipk -type f ! -name 'luci-app-ssr-plus*.ipk' -exec cp -av {} output/build-run/depends/ \;
-          cp -av output/install.sh output/build-run/install.sh
+          echo "ssrp_pkg_version=${ssrp_pkg_version}" >> "$GITHUB_OUTPUT"
+          echo "Parsed package version: ${ssrp_pkg_version}"
 
       - name: Make .run package
         run: |
           set -euo pipefail
+          chmod +x scripts/install.sh scripts/make-run.sh
 
-          RUN_NAME="ssrplus-${{ matrix.arch_label }}-${{ steps.parse_version.outputs.ssrp_version }}.run"
-
-          makeself \
-            --nox11 \
-            output/build-run \
-            output/run/${RUN_NAME} \
-            "SSR Plus ${{ steps.parse_version.outputs.ssrp_version }} for ${{ matrix.arch_label }}" \
-            ./install.sh
+          bash scripts/make-run.sh \
+            "ssrplus-full" \
+            "${OPENWRT_VERSION}" \
+            "${{ matrix.arch_label }}" \
+            "${{ steps.parse_version.outputs.ssrp_pkg_version }}" \
+            "${GITHUB_WORKSPACE}/output/ipk"
 
       - name: Verify run package exists
         run: |
@@ -325,5 +282,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-update.outputs.release_tag }}
-          name: SSR Plus ${{ needs.check-update.outputs.ssrplus_version }}
+          name: SSR Plus ${{ needs.check-update.outputs.ssrplus_version }} for OpenWrt ${{ env.OPENWRT_VERSION }}
           files: dist/**/*.run
