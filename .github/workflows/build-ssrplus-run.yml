@@ -78,7 +78,7 @@ jobs:
           rm -rf output tmp
           mkdir -p output/ipk output/run tmp
 
-      - name: Download package indexes from dl.openwrt.ai
+      - name: Download dl.openwrt.ai package indexes
         run: |
           set -euo pipefail
 
@@ -106,7 +106,7 @@ jobs:
             tmp/Kiddin9-Packages
             tmp/Packages-Packages
 
-      - name: Download SSR Plus ipks from kiddin9 and packages
+      - name: Download prebuilt SSR Plus ipks
         run: |
           set -euo pipefail
 
@@ -145,7 +145,7 @@ jobs:
 
           awk_get_filename() {
             local pkg="$1"
-            local index="$2"
+            local index_file="$2"
             awk -v pkg="$pkg" '
               BEGIN { RS=""; FS="\n" }
               {
@@ -159,7 +159,7 @@ jobs:
                   exit
                 }
               }
-            ' "$index"
+            ' "$index_file"
           }
 
           download_with_retry() {
