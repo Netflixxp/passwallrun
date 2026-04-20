@@ -23,7 +23,6 @@ jobs:
       build_needed: ${{ steps.check.outputs.build_needed }}
       passwall_version: ${{ steps.check.outputs.passwall_version }}
       release_tag: ${{ steps.check.outputs.release_tag }}
-      asset_version: ${{ steps.check.outputs.asset_version }}
     steps:
       - name: Check latest PassWall version
         id: check
@@ -36,12 +35,6 @@ jobs:
           PASSWALL_VERSION="$(gh api repos/Openwrt-Passwall/openwrt-passwall/releases/latest --jq '.tag_name')"
           RELEASE_TAG="build-${PASSWALL_VERSION}"
 
-          # GitHub release tag: 26.4.15-1
-          # Asset version:     26.4.15-r1
-          BASE_VER="${PASSWALL_VERSION%-*}"
-          REL_NO="${PASSWALL_VERSION##*-}"
-          ASSET_VERSION="${BASE_VER}-r${REL_NO}"
-
           BUILD_NEEDED="true"
           if [ "${FORCE_BUILD}" != "true" ]; then
             if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
@@ -51,7 +44,6 @@ jobs:
 
           echo "passwall_version=${PASSWALL_VERSION}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "asset_version=${ASSET_VERSION}" >> "$GITHUB_OUTPUT"
           echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -69,7 +61,6 @@ jobs:
 
     env:
       PASSWALL_VERSION: ${{ needs.check-update.outputs.passwall_version }}
-      ASSET_VERSION: ${{ needs.check-update.outputs.asset_version }}
 
     steps:
       - name: Checkout current repo
@@ -81,30 +72,35 @@ jobs:
           sudo apt-get install -y \
             curl wget jq gzip makeself gh ca-certificates
 
-      - name: Prepare output directories
+      - name: Prepare directories
         run: |
           set -euo pipefail
           mkdir -p output/ipk output/run tmp
 
-      - name: Download SourceForge package index
+      - name: Download SourceForge package indexes
         run: |
           set -euo pipefail
 
-          BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
-          INDEX_URL="${BASE_URL}/Packages.gz/download"
+          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+          LUCI_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_luci"
 
           curl -L --fail --retry 5 --retry-delay 3 \
-            -o tmp/Packages.gz "${INDEX_URL}"
+            -o tmp/Packages.gz \
+            "${PKG_BASE_URL}/Packages.gz/download"
+
+          curl -L --fail --retry 5 --retry-delay 3 \
+            -o tmp/LUCI-Packages.gz \
+            "${LUCI_BASE_URL}/Packages.gz/download"
 
           gunzip -c tmp/Packages.gz > tmp/Packages
+          gunzip -c tmp/LUCI-Packages.gz > tmp/LUCI-Packages
 
       - name: Download prebuilt dependency ipks from SourceForge
         run: |
           set -euo pipefail
 
-          BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
 
-          # 这里放你要塞进 .run 的预编译依赖
           PKGS=(
             chinadns-ng
             dns2socks
@@ -151,31 +147,52 @@ jobs:
           for pkg in "${PKGS[@]}"; do
             filename="$(awk_get_filename "$pkg" || true)"
             if [ -z "${filename:-}" ]; then
-              echo "ERROR: package not found in Packages index: $pkg"
+              echo "ERROR: package not found in passwall_packages index: $pkg"
               exit 1
             fi
 
             echo "Downloading $filename"
             curl -L --fail --retry 5 --retry-delay 3 \
               -o "output/ipk/$(basename "$filename")" \
-              "${BASE_URL}/$(basename "$filename")/download"
+              "${PKG_BASE_URL}/$(basename "$filename")/download"
           done
 
-      - name: Download LuCI main package and zh-cn language package from GitHub release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download LuCI main package and zh-cn package from SourceForge
         run: |
           set -euo pipefail
 
-          gh release download "${PASSWALL_VERSION}" \
-            --repo Openwrt-Passwall/openwrt-passwall \
-            --pattern "23.05-24.10_luci-app-passwall_${ASSET_VERSION}_all.ipk" \
-            --dir output/ipk
+          LUCI_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_luci"
 
-          gh release download "${PASSWALL_VERSION}" \
-            --repo Openwrt-Passwall/openwrt-passwall \
-            --pattern "23.05-24.10_luci-i18n-passwall-zh-cn_${ASSET_VERSION}_all.ipk" \
-            --dir output/ipk
+          awk_get_luci_filename() {
+            local pkg="$1"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /)  p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' tmp/LUCI-Packages
+          }
+
+          for pkg in luci-app-passwall luci-i18n-passwall-zh-cn; do
+            filename="$(awk_get_luci_filename "$pkg" || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: LuCI package not found in passwall_luci index: $pkg"
+              exit 1
+            fi
+
+            echo "Downloading $filename"
+            curl -L --fail --retry 5 --retry-delay 3 \
+              -o "output/ipk/$(basename "$filename")" \
+              "${LUCI_BASE_URL}/$(basename "$filename")/download"
+          done
 
       - name: Show downloaded files
         run: |
