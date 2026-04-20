@@ -1,4 +1,4 @@
-name: Build SSR Plus .run
+name: Build SSR Plus .run from prebuilt IPKs
 
 on:
   workflow_dispatch:
@@ -55,16 +55,9 @@ jobs:
       matrix:
         include:
           - arch_label: x86_64
-            sdk_target: x86
-            sdk_subtarget: 64
-            sdk_arch_suffix: gcc-13.3.0_musl
-            sf_arch: x86_64
-
+            base_url: "https://dl.openwrt.ai/packages-24.10/x86_64"
           - arch_label: aarch64_generic
-            sdk_target: rockchip
-            sdk_subtarget: armv8
-            sdk_arch_suffix: gcc-13.3.0_musl
-            sf_arch: aarch64_generic
+            base_url: "https://dl.openwrt.ai/packages-24.10/aarch64_generic"
 
     env:
       SSRPLUS_VERSION: ${{ needs.check-update.outputs.ssrplus_version }}
@@ -76,10 +69,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            curl wget jq gzip makeself gh ca-certificates \
-            clang build-essential zstd gawk unzip \
-            python3-pyelftools python3-dev python3-setuptools swig
+          sudo apt-get install -y curl wget jq gzip makeself gh ca-certificates
 
       - name: Prepare directories
         run: |
@@ -87,11 +77,9 @@ jobs:
           rm -rf output tmp
           mkdir -p output/ipk output/run tmp
 
-      - name: Download SourceForge package index
+      - name: Download package indexes
         run: |
           set -euo pipefail
-
-          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
 
           download_with_retry() {
             local url="$1"
@@ -100,20 +88,65 @@ jobs:
               -o "$out" "$url"
           }
 
-          download_with_retry "${PKG_BASE_URL}/Packages.gz/download" "tmp/Packages.gz"
-          gunzip -c tmp/Packages.gz > tmp/Packages
+          download_with_retry "${{ matrix.base_url }}/kiddin9/Packages.gz" "tmp/Kiddin9-Packages.gz"
+          gunzip -c tmp/Kiddin9-Packages.gz > tmp/Kiddin9-Packages
 
-      - name: Download common dependency ipks from SourceForge
+          download_with_retry "${{ matrix.base_url }}/packages/Packages.gz" "tmp/Packages-Packages.gz"
+          gunzip -c tmp/Packages-Packages.gz > tmp/Packages-Packages
+
+          download_with_retry "${{ matrix.base_url }}/base/Packages.gz" "tmp/Base-Packages.gz"
+          gunzip -c tmp/Base-Packages.gz > tmp/Base-Packages
+
+      - name: Save indexes
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssrplus-indexes-${{ matrix.arch_label }}
+          path: |
+            tmp/Kiddin9-Packages
+            tmp/Packages-Packages
+            tmp/Base-Packages
+
+      - name: Download SSR Plus and dependencies
         run: |
           set -euo pipefail
 
-          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+          K_BASE="${{ matrix.base_url }}/kiddin9"
+          P_BASE="${{ matrix.base_url }}/packages"
+          B_BASE="${{ matrix.base_url }}/base"
 
-          PKGS=(
-            chinadns-ng
+          get_filename() {
+            local pkg="$1"
+            local index="$2"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /) p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' "$index"
+          }
+
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
+          # kiddin9 里的主要包
+          K_PKGS=(
+            luci-app-ssr-plus
             dns2socks
             microsocks
             ipt2socks
+            chinadns-ng
             tcping
             xray-core
             v2ray-plugin
@@ -122,7 +155,6 @@ jobs:
             shadowsocks-rust-ssserver
             shadowsocksr-libev-ssr-local
             shadowsocksr-libev-ssr-redir
-            shadowsocksr-libev-ssr-check
             simple-obfs-client
             naiveproxy
             shadow-tls
@@ -131,149 +163,37 @@ jobs:
             hysteria
           )
 
-          awk_get_filename() {
-            local pkg="$1"
-            awk -v pkg="$pkg" '
-              BEGIN { RS=""; FS="\n" }
-              {
-                p=""; f=""
-                for (i=1; i<=NF; i++) {
-                  if ($i ~ /^Package: /)  p=substr($i, 10)
-                  if ($i ~ /^Filename: /) f=substr($i, 11)
-                }
-                if (p == pkg && f != "") {
-                  print f
-                  exit
-                }
-              }
-            ' tmp/Packages
-          }
-
-          download_with_retry() {
-            local url="$1"
-            local out="$2"
-            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
-              -o "$out" "$url"
-          }
-
-          for pkg in "${PKGS[@]}"; do
-            filename="$(awk_get_filename "$pkg" || true)"
+          for pkg in "${K_PKGS[@]}"; do
+            filename="$(get_filename "$pkg" tmp/Kiddin9-Packages || true)"
             if [ -z "${filename:-}" ]; then
-              echo "ERROR: package not found in SourceForge index: $pkg"
+              echo "ERROR: package not found in kiddin9 index: $pkg"
               exit 1
             fi
-
             echo "Downloading $filename"
-            download_with_retry \
-              "${PKG_BASE_URL}/$(basename "$filename")/download" \
-              "output/ipk/$(basename "$filename")"
+            download_with_retry "${K_BASE}/$(basename "$filename")" "output/ipk/$(basename "$filename")"
           done
 
-      - name: Prepare OpenWrt SDK
-        run: |
-          set -euo pipefail
-
-          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}.0-${{ matrix.sdk_target }}-${{ matrix.sdk_subtarget }}_${{ matrix.sdk_arch_suffix }}.Linux-x86_64.tar.zst"
-          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}.0/targets/${{ matrix.sdk_target }}/${{ matrix.sdk_subtarget }}/${SDK_FILE}"
-
-          wget -O tmp/sdk.tar.zst "${SDK_URL}"
-          tar --zstd -xf tmp/sdk.tar.zst
-          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
-          echo "SDK_DIR=${SDK_DIR}" >> "$GITHUB_ENV"
-
-      - name: Update feeds and clone helloworld
-        working-directory: ${{ env.SDK_DIR }}
-        run: |
-          set -euo pipefail
-
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-          rm -rf package/helloworld
-          git clone --depth=1 https://github.com/fw876/helloworld.git package/helloworld
-
-      - name: Generate .config for SSR Plus
-        working-directory: ${{ env.SDK_DIR }}
-        run: |
-          set -euo pipefail
-
-          cat > .config <<'EOF'
-          CONFIG_ALL_NONSHARED=y
-          CONFIG_ALL_KMODS=n
-          CONFIG_ALL=n
-          CONFIG_AUTOREMOVE=y
-
-          CONFIG_PACKAGE_lua-neturl=m
-          CONFIG_PACKAGE_luci-app-ssr-plus=m
-
-          CONFIG_PACKAGE_luci-app-ssr-plus_Iptables_Transparent_Proxy=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_Nftables_Transparent_Proxy=y
-
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NONE_V2RAY=y
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_V2ray=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=n
-
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_ChinaDNS_NG=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_DNS2SOCKS=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_DNS2SOCKS_RUST=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_DNS2TCP=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_DNSPROXY=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_MosDNS=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Hysteria=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Tuic_Client=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadow_TLS=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_IPT2Socks=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Kcptun=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NaiveProxy=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Redsocks2=n
-
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_NONE_Client=y
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Libev_Client=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Rust_Client=n
-
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_NONE_Server=y
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Libev_Server=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Rust_Server=n
-
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Simple_Obfs=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_V2ray_Plugin=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_ShadowsocksR_Libev_Client=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_ShadowsocksR_Libev_Server=n
-          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Trojan=n
-          EOF
-
-          make defconfig
-
-      - name: Build SSR Plus packages
-        working-directory: ${{ env.SDK_DIR }}
-        run: |
-          set -euo pipefail
-
-          FAILED_PKGS=""
-
-          for p in lua-neturl luci-app-ssr-plus; do
-            echo "===== Building package/$p ====="
-            if ! make "package/$p/compile" V=s -j"$(nproc)"; then
-              echo "Retrying $p with -j1 ..."
-              if ! make "package/$p/compile" V=s -j1; then
-                echo "FAILED: $p"
-                FAILED_PKGS="$FAILED_PKGS $p"
-              fi
+          # packages 源补 libudns
+          for pkg in libudns; do
+            filename="$(get_filename "$pkg" tmp/Packages-Packages || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in packages index: $pkg"
+              exit 1
             fi
+            echo "Downloading $filename"
+            download_with_retry "${P_BASE}/$(basename "$filename")" "output/ipk/$(basename "$filename")"
           done
 
-          if [ -n "$FAILED_PKGS" ]; then
-            echo "The following packages failed:$FAILED_PKGS"
-            exit 1
-          fi
-
-      - name: Collect compiled SSR Plus ipks
-        working-directory: ${{ env.SDK_DIR }}
-        run: |
-          set -euo pipefail
-
-          find bin -type f \( -name "lua-neturl*.ipk" -o -name "luci-app-ssr-plus*.ipk" \) \
-            -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \;
+          # base 源补 libopenssl3
+          for pkg in libopenssl3; do
+            filename="$(get_filename "$pkg" tmp/Base-Packages || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in base index: $pkg"
+              exit 1
+            fi
+            echo "Downloading $filename"
+            download_with_retry "${B_BASE}/$(basename "$filename")" "output/ipk/$(basename "$filename")"
+          done
 
       - name: Verify required packages
         run: |
@@ -281,12 +201,13 @@ jobs:
 
           required_patterns=(
             "luci-app-ssr-plus_*.ipk"
-            "lua-neturl_*.ipk"
             "xray-core_*.ipk"
             "chinadns-ng_*.ipk"
             "dns2socks_*.ipk"
             "microsocks_*.ipk"
             "ipt2socks_*.ipk"
+            "libudns_*.ipk"
+            "libopenssl3_*.ipk"
           )
 
           for pattern in "${required_patterns[@]}"; do
