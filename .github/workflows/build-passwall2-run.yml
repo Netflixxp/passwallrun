@@ -1,0 +1,296 @@
+name: Build PassWall2 .run from SourceForge
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force build even if current PassWall2 version is already built"
+        required: false
+        default: "false"
+  schedule:
+    - cron: '27 19 * * *'
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: "24.10"
+
+jobs:
+  check-update:
+    runs-on: ubuntu-22.04
+    outputs:
+      build_needed: ${{ steps.check.outputs.build_needed }}
+      passwall2_version: ${{ steps.check.outputs.passwall2_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Check latest PassWall2 version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
+        run: |
+          set -euo pipefail
+
+          PASSWALL2_VERSION="$(gh api repos/Openwrt-Passwall/openwrt-passwall2/releases/latest --jq '.tag_name')"
+          RELEASE_TAG="build-passwall2-${PASSWALL2_VERSION}"
+
+          BUILD_NEEDED="true"
+          if [ "${FORCE_BUILD}" != "true" ]; then
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              BUILD_NEEDED="false"
+            fi
+          fi
+
+          echo "passwall2_version=${PASSWALL2_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-update
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: x86_64
+            sf_arch: x86_64
+          - arch_label: aarch64_generic
+            sf_arch: aarch64_generic
+
+    env:
+      PASSWALL2_VERSION: ${{ needs.check-update.outputs.passwall2_version }}
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl wget jq gzip makeself gh ca-certificates
+
+      - name: Prepare directories
+        run: |
+          set -euo pipefail
+          rm -rf output tmp
+          mkdir -p output/ipk output/run tmp
+
+      - name: Download SourceForge package indexes
+        run: |
+          set -euo pipefail
+
+          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+          PW2_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall2"
+
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
+          download_with_retry "${PKG_BASE_URL}/Packages.gz/download" "tmp/Packages.gz"
+          download_with_retry "${PW2_BASE_URL}/Packages.gz/download" "tmp/PW2-Packages.gz"
+
+          gunzip -c tmp/Packages.gz > tmp/Packages
+          gunzip -c tmp/PW2-Packages.gz > tmp/PW2-Packages
+
+      - name: Save package indexes
+        uses: actions/upload-artifact@v4
+        with:
+          name: passwall2-indexes-${{ matrix.arch_label }}
+          path: |
+            tmp/Packages
+            tmp/PW2-Packages
+
+      - name: Download prebuilt dependency ipks from SourceForge
+        run: |
+          set -euo pipefail
+
+          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+
+          PKGS=(
+            chinadns-ng
+            dns2socks
+            geoview
+            hysteria
+            ipt2socks
+            microsocks
+            naiveproxy
+            shadow-tls
+            shadowsocks-rust-sslocal
+            shadowsocks-rust-ssserver
+            shadowsocksr-libev-ssr-local
+            shadowsocksr-libev-ssr-redir
+            simple-obfs-client
+            tcping
+            trojan-plus
+            tuic-client
+            v2ray-geoip
+            v2ray-geosite
+            v2ray-plugin
+            xray-core
+            xray-plugin
+            sing-box
+          )
+
+          awk_get_filename() {
+            local pkg="$1"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /)  p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' tmp/Packages
+          }
+
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
+          for pkg in "${PKGS[@]}"; do
+            filename="$(awk_get_filename "$pkg" || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in passwall_packages index: $pkg"
+              exit 1
+            fi
+
+            echo "Downloading $filename"
+            download_with_retry \
+              "${PKG_BASE_URL}/$(basename "$filename")/download" \
+              "output/ipk/$(basename "$filename")"
+          done
+
+      - name: Download PassWall2 main package and zh-cn package from SourceForge
+        run: |
+          set -euo pipefail
+
+          PW2_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall2"
+
+          awk_get_pw2_filename() {
+            local pkg="$1"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /)  p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' tmp/PW2-Packages
+          }
+
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
+          for pkg in luci-app-passwall2 luci-i18n-passwall2-zh-cn; do
+            filename="$(awk_get_pw2_filename "$pkg" || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: PassWall2 package not found in passwall2 index: $pkg"
+              exit 1
+            fi
+
+            echo "Downloading $filename"
+            download_with_retry \
+              "${PW2_BASE_URL}/$(basename "$filename")/download" \
+              "output/ipk/$(basename "$filename")"
+          done
+
+      - name: Verify required packages
+        run: |
+          set -euo pipefail
+
+          required_patterns=(
+            "luci-app-passwall2_*.ipk"
+            "luci-i18n-passwall2-zh-cn_*.ipk"
+            "xray-core_*.ipk"
+            "sing-box_*.ipk"
+            "hysteria_*.ipk"
+            "chinadns-ng_*.ipk"
+            "dns2socks_*.ipk"
+          )
+
+          for pattern in "${required_patterns[@]}"; do
+            if ! compgen -G "output/ipk/${pattern}" > /dev/null; then
+              echo "ERROR: required package missing: ${pattern}"
+              ls -lah output/ipk || true
+              exit 1
+            fi
+          done
+
+      - name: Show downloaded files
+        run: |
+          ls -lah output/ipk
+
+      - name: Make .run package
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install.sh scripts/make-run.sh
+
+          bash scripts/make-run.sh \
+            "passwall2-full" \
+            "${OPENWRT_VERSION}" \
+            "${{ matrix.arch_label }}" \
+            "${PASSWALL2_VERSION}" \
+            "${GITHUB_WORKSPACE}/output/ipk"
+
+      - name: Verify run package exists
+        run: |
+          set -euo pipefail
+          compgen -G "output/run/*.run" > /dev/null || {
+            echo "ERROR: no .run file generated"
+            exit 1
+          }
+          ls -lah output/run
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: passwall2-${{ matrix.arch_label }}
+          path: output/run/*.run
+
+  release:
+    needs:
+      - check-update
+      - build
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show files
+        run: |
+          find dist -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-update.outputs.release_tag }}
+          name: PassWall2 ${{ needs.check-update.outputs.passwall2_version }} for OpenWrt ${{ env.OPENWRT_VERSION }}
+          files: dist/**/*.run
