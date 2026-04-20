@@ -75,6 +75,7 @@ jobs:
       - name: Prepare directories
         run: |
           set -euo pipefail
+          rm -rf output tmp
           mkdir -p output/ipk output/run tmp
 
       - name: Download SourceForge package indexes
@@ -84,16 +85,26 @@ jobs:
           PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
           LUCI_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_luci"
 
-          curl -L --fail --retry 5 --retry-delay 3 \
-            -o tmp/Packages.gz \
-            "${PKG_BASE_URL}/Packages.gz/download"
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
 
-          curl -L --fail --retry 5 --retry-delay 3 \
-            -o tmp/LUCI-Packages.gz \
-            "${LUCI_BASE_URL}/Packages.gz/download"
+          download_with_retry "${PKG_BASE_URL}/Packages.gz/download" "tmp/Packages.gz"
+          download_with_retry "${LUCI_BASE_URL}/Packages.gz/download" "tmp/LUCI-Packages.gz"
 
           gunzip -c tmp/Packages.gz > tmp/Packages
           gunzip -c tmp/LUCI-Packages.gz > tmp/LUCI-Packages
+
+      - name: Save package indexes
+        uses: actions/upload-artifact@v4
+        with:
+          name: indexes-${{ matrix.arch_label }}
+          path: |
+            tmp/Packages
+            tmp/LUCI-Packages
 
       - name: Download prebuilt dependency ipks from SourceForge
         run: |
@@ -144,6 +155,13 @@ jobs:
             ' tmp/Packages
           }
 
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
           for pkg in "${PKGS[@]}"; do
             filename="$(awk_get_filename "$pkg" || true)"
             if [ -z "${filename:-}" ]; then
@@ -152,9 +170,9 @@ jobs:
             fi
 
             echo "Downloading $filename"
-            curl -L --fail --retry 5 --retry-delay 3 \
-              -o "output/ipk/$(basename "$filename")" \
-              "${PKG_BASE_URL}/$(basename "$filename")/download"
+            download_with_retry \
+              "${PKG_BASE_URL}/$(basename "$filename")/download" \
+              "output/ipk/$(basename "$filename")"
           done
 
       - name: Download LuCI main package and zh-cn package from SourceForge
@@ -181,6 +199,13 @@ jobs:
             ' tmp/LUCI-Packages
           }
 
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
           for pkg in luci-app-passwall luci-i18n-passwall-zh-cn; do
             filename="$(awk_get_luci_filename "$pkg" || true)"
             if [ -z "${filename:-}" ]; then
@@ -189,9 +214,31 @@ jobs:
             fi
 
             echo "Downloading $filename"
-            curl -L --fail --retry 5 --retry-delay 3 \
-              -o "output/ipk/$(basename "$filename")" \
-              "${LUCI_BASE_URL}/$(basename "$filename")/download"
+            download_with_retry \
+              "${LUCI_BASE_URL}/$(basename "$filename")/download" \
+              "output/ipk/$(basename "$filename")"
+          done
+
+      - name: Verify required packages
+        run: |
+          set -euo pipefail
+
+          required_patterns=(
+            "luci-app-passwall_*.ipk"
+            "luci-i18n-passwall-zh-cn_*.ipk"
+            "xray-core_*.ipk"
+            "sing-box_*.ipk"
+            "hysteria_*.ipk"
+            "chinadns-ng_*.ipk"
+            "dns2socks_*.ipk"
+          )
+
+          for pattern in "${required_patterns[@]}"; do
+            if ! compgen -G "output/ipk/${pattern}" > /dev/null; then
+              echo "ERROR: required package missing: ${pattern}"
+              ls -lah output/ipk || true
+              exit 1
+            fi
           done
 
       - name: Show downloaded files
@@ -209,6 +256,15 @@ jobs:
             "${{ matrix.arch_label }}" \
             "${PASSWALL_VERSION}" \
             "${GITHUB_WORKSPACE}/output/ipk"
+
+      - name: Verify run package exists
+        run: |
+          set -euo pipefail
+          compgen -G "output/run/*.run" > /dev/null || {
+            echo "ERROR: no .run file generated"
+            exit 1
+          }
+          ls -lah output/run
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -236,5 +292,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-update.outputs.release_tag }}
-          name: PassWall ${{ needs.check-update.outputs.passwall_version }}
+          name: PassWall ${{ needs.check-update.outputs.passwall_version }} for OpenWrt ${{ env.OPENWRT_VERSION }}
           files: dist/**/*.run
