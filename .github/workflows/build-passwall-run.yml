@@ -1,4 +1,4 @@
-name: Build PassWall .run
+name: Build PassWall .run from SourceForge
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 env:
-  OPENWRT_VERSION: "24.10.6"
+  OPENWRT_VERSION: "24.10"
 
 jobs:
   check-update:
@@ -23,6 +23,7 @@ jobs:
       build_needed: ${{ steps.check.outputs.build_needed }}
       passwall_version: ${{ steps.check.outputs.passwall_version }}
       release_tag: ${{ steps.check.outputs.release_tag }}
+      asset_version: ${{ steps.check.outputs.asset_version }}
     steps:
       - name: Check latest PassWall version
         id: check
@@ -30,9 +31,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE_BUILD: ${{ github.event.inputs.force_build }}
         run: |
-          set -e
+          set -euo pipefail
+
           PASSWALL_VERSION="$(gh api repos/Openwrt-Passwall/openwrt-passwall/releases/latest --jq '.tag_name')"
           RELEASE_TAG="build-${PASSWALL_VERSION}"
+
+          # GitHub release tag: 26.4.15-1
+          # Asset version:     26.4.15-r1
+          BASE_VER="${PASSWALL_VERSION%-*}"
+          REL_NO="${PASSWALL_VERSION##*-}"
+          ASSET_VERSION="${BASE_VER}-r${REL_NO}"
 
           BUILD_NEEDED="true"
           if [ "${FORCE_BUILD}" != "true" ]; then
@@ -43,6 +51,7 @@ jobs:
 
           echo "passwall_version=${PASSWALL_VERSION}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "asset_version=${ASSET_VERSION}" >> "$GITHUB_OUTPUT"
           echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -53,29 +62,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: x86_64
-            target: x86
-            subtarget: 64
-            sdk_arch_suffix: gcc-13.3.0_musl
-            arch_label: x86_64
-            hot_packages: >-
-              xray-core
-              sing-box
-
-          - name: aarch64_generic
-            target: rockchip
-            subtarget: armv8
-            sdk_arch_suffix: gcc-13.3.0_musl
-            arch_label: aarch64_generic
-            hot_packages: >-
-              xray-core
-              sing-box
+          - arch_label: x86_64
+            sf_arch: x86_64
+          - arch_label: aarch64_generic
+            sf_arch: aarch64_generic
 
     env:
       PASSWALL_VERSION: ${{ needs.check-update.outputs.passwall_version }}
-      MAIN_PACKAGES: >-
-        luci-app-passwall
-        luci-i18n-passwall-zh-cn
+      ASSET_VERSION: ${{ needs.check-update.outputs.asset_version }}
 
     steps:
       - name: Checkout current repo
@@ -85,117 +79,113 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
-            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
-            fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
-            haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev \
-            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
-            libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
-            lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
-            python3-distutils python3-pip python3-ply python3-docutils python3-pyelftools qemu-utils \
-            rsync scons squashfs-tools subversion swig texinfo uglifyjs unzip \
-            upx-ucl vim wget xmlto xxd zlib1g-dev zstd jq file gh makeself zip ca-certificates
+            curl wget jq gzip makeself gh ca-certificates
 
-      - name: Prepare SDK variables
-        id: vars
-        shell: bash
+      - name: Prepare output directories
         run: |
-          set -e
-          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}-${{ matrix.target }}-${{ matrix.subtarget }}_${{ matrix.sdk_arch_suffix }}.Linux-x86_64.tar.zst"
-          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.target }}/${{ matrix.subtarget }}/${SDK_FILE}"
-          echo "sdk_file=${SDK_FILE}" >> "$GITHUB_OUTPUT"
-          echo "sdk_url=${SDK_URL}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          mkdir -p output/ipk output/run tmp
 
-      - name: Download SDK
+      - name: Download SourceForge package index
         run: |
-          set -e
-          wget -O "${{ steps.vars.outputs.sdk_file }}" "${{ steps.vars.outputs.sdk_url }}"
+          set -euo pipefail
 
-      - name: Extract SDK
-        shell: bash
+          BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+          INDEX_URL="${BASE_URL}/Packages.gz/download"
+
+          curl -L --fail --retry 5 --retry-delay 3 \
+            -o tmp/Packages.gz "${INDEX_URL}"
+
+          gunzip -c tmp/Packages.gz > tmp/Packages
+
+      - name: Download prebuilt dependency ipks from SourceForge
         run: |
-          set -e
-          tar --zstd -xf "${{ steps.vars.outputs.sdk_file }}"
-          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
-          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+          set -euo pipefail
 
-      - name: Update feeds and clone PassWall sources
-        working-directory: ${{ env.SDK_DIR }}
-        shell: bash
-        run: |
-          set -e
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
 
-          rm -rf feeds/packages/net/{xray-core,v2ray-geodata,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-libev,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,trojan-plus,tuic-client,v2ray-plugin,xray-plugin,geoview,shadow-tls} || true
-          rm -rf feeds/luci/applications/luci-app-passwall || true
+          # 这里放你要塞进 .run 的预编译依赖
+          PKGS=(
+            chinadns-ng
+            dns2socks
+            geoview
+            hysteria
+            ipt2socks
+            microsocks
+            naiveproxy
+            shadow-tls
+            shadowsocks-rust-sslocal
+            shadowsocks-rust-ssserver
+            shadowsocksr-libev-ssr-local
+            shadowsocksr-libev-ssr-redir
+            simple-obfs-client
+            tcping
+            trojan-plus
+            tuic-client
+            v2ray-geoip
+            v2ray-geosite
+            v2ray-plugin
+            xray-core
+            xray-plugin
+            sing-box
+          )
 
-          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git package/passwall-packages
-          git clone --depth=1 https://github.com/Openwrt-Passwall/openwrt-passwall.git package/passwall-luci
+          awk_get_filename() {
+            local pkg="$1"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /)  p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' tmp/Packages
+          }
 
-      - name: Generate .config
-        working-directory: ${{ env.SDK_DIR }}
-        shell: bash
-        run: |
-          set -e
-          cat > .config <<'EOF'
-          CONFIG_ALL_NONSHARED=y
-          CONFIG_ALL_KMODS=n
-          CONFIG_ALL=n
-          CONFIG_AUTOREMOVE=y
-          EOF
-
-          for p in $MAIN_PACKAGES ${{ matrix.hot_packages }}; do
-            echo "CONFIG_PACKAGE_${p}=m" >> .config
-          done
-
-          make defconfig
-
-      - name: Build hot packages
-        working-directory: ${{ env.SDK_DIR }}
-        shell: bash
-        run: |
-          set -e
-          FAILED_PKGS=""
-          for p in $MAIN_PACKAGES ${{ matrix.hot_packages }}; do
-            echo "===== Building package/$p ====="
-            if ! make "package/$p/compile" V=s -j"$(nproc)"; then
-              echo "Retrying $p with -j1 ..."
-              if ! make "package/$p/compile" V=s -j1; then
-                echo "FAILED: $p"
-                FAILED_PKGS="$FAILED_PKGS $p"
-              fi
+          for pkg in "${PKGS[@]}"; do
+            filename="$(awk_get_filename "$pkg" || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in Packages index: $pkg"
+              exit 1
             fi
+
+            echo "Downloading $filename"
+            curl -L --fail --retry 5 --retry-delay 3 \
+              -o "output/ipk/$(basename "$filename")" \
+              "${BASE_URL}/$(basename "$filename")/download"
           done
 
-          if [ -n "$FAILED_PKGS" ]; then
-            echo "The following packages failed:$FAILED_PKGS"
-            exit 1
-          fi
-
-      - name: Download weekly deps zip
+      - name: Download LuCI main package and zh-cn language package from GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          mkdir -p weekly
-          gh release download weekly-deps --pattern "deps-weekly-${{ matrix.arch_label }}.zip" --dir weekly
+          set -euo pipefail
 
-      - name: Collect hot packages and merge deps
-        working-directory: ${{ env.SDK_DIR }}
-        shell: bash
+          gh release download "${PASSWALL_VERSION}" \
+            --repo Openwrt-Passwall/openwrt-passwall \
+            --pattern "23.05-24.10_luci-app-passwall_${ASSET_VERSION}_all.ipk" \
+            --dir output/ipk
+
+          gh release download "${PASSWALL_VERSION}" \
+            --repo Openwrt-Passwall/openwrt-passwall \
+            --pattern "23.05-24.10_luci-i18n-passwall-zh-cn_${ASSET_VERSION}_all.ipk" \
+            --dir output/ipk
+
+      - name: Show downloaded files
         run: |
-          set -e
-          mkdir -p "${GITHUB_WORKSPACE}/output/ipk"
-          find bin -type f -name "*.ipk" -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \;
-
-          unzip -o "${GITHUB_WORKSPACE}/weekly/deps-weekly-${{ matrix.arch_label }}.zip" -d "${GITHUB_WORKSPACE}/output/ipk"
+          ls -lah output/ipk
 
       - name: Make .run package
-        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           chmod +x scripts/install.sh scripts/make-run.sh
+
           bash scripts/make-run.sh \
             "passwall-full" \
             "${OPENWRT_VERSION}" \
@@ -203,7 +193,7 @@ jobs:
             "${PASSWALL_VERSION}" \
             "${GITHUB_WORKSPACE}/output/ipk"
 
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: passwall-${{ matrix.arch_label }}
@@ -216,12 +206,16 @@ jobs:
     if: needs.check-update.outputs.build_needed == 'true'
     runs-on: ubuntu-22.04
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: Create release
+      - name: Show files
+        run: |
+          find dist -type f | sort
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check-update.outputs.release_tag }}
