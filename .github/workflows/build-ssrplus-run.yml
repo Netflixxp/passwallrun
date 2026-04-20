@@ -1,0 +1,333 @@
+name: Build SSR Plus .run
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force build even if current SSR Plus version is already built"
+        required: false
+        default: "false"
+  schedule:
+    - cron: '37 19 * * *'
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: "24.10"
+
+jobs:
+  check-update:
+    runs-on: ubuntu-22.04
+    outputs:
+      build_needed: ${{ steps.check.outputs.build_needed }}
+      ssrplus_version: ${{ steps.check.outputs.ssrplus_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Check latest helloworld commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
+        run: |
+          set -euo pipefail
+
+          SSRPLUS_VERSION="$(gh api repos/fw876/helloworld/commits/master --jq '.sha' | cut -c1-7)"
+          RELEASE_TAG="build-ssrplus-${SSRPLUS_VERSION}"
+
+          BUILD_NEEDED="true"
+          if [ "${FORCE_BUILD}" != "true" ]; then
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              BUILD_NEEDED="false"
+            fi
+          fi
+
+          echo "ssrplus_version=${SSRPLUS_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-update
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: x86_64
+            sdk_target: x86
+            sdk_subtarget: 64
+            sdk_arch_suffix: gcc-13.3.0_musl
+            sf_arch: x86_64
+
+          - arch_label: aarch64_generic
+            sdk_target: rockchip
+            sdk_subtarget: armv8
+            sdk_arch_suffix: gcc-13.3.0_musl
+            sf_arch: aarch64_generic
+
+    env:
+      SSRPLUS_VERSION: ${{ needs.check-update.outputs.ssrplus_version }}
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl wget jq gzip makeself gh ca-certificates \
+            clang build-essential zstd gawk unzip
+
+      - name: Prepare directories
+        run: |
+          set -euo pipefail
+          rm -rf output tmp
+          mkdir -p output/ipk output/run tmp
+
+      - name: Download SourceForge package index
+        run: |
+          set -euo pipefail
+
+          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
+          download_with_retry "${PKG_BASE_URL}/Packages.gz/download" "tmp/Packages.gz"
+          gunzip -c tmp/Packages.gz > tmp/Packages
+
+      - name: Download common dependency ipks from SourceForge
+        run: |
+          set -euo pipefail
+
+          PKG_BASE_URL="https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-${OPENWRT_VERSION}/${{ matrix.sf_arch }}/passwall_packages"
+
+          PKGS=(
+            chinadns-ng
+            dns2socks
+            microsocks
+            ipt2socks
+            tcping
+            xray-core
+            v2ray-plugin
+            xray-plugin
+            shadowsocks-rust-sslocal
+            shadowsocks-rust-ssserver
+            shadowsocksr-libev-ssr-local
+            shadowsocksr-libev-ssr-redir
+            shadowsocksr-libev-ssr-check
+            simple-obfs-client
+            naiveproxy
+            shadow-tls
+            trojan-plus
+            tuic-client
+            hysteria
+          )
+
+          awk_get_filename() {
+            local pkg="$1"
+            awk -v pkg="$pkg" '
+              BEGIN { RS=""; FS="\n" }
+              {
+                p=""; f=""
+                for (i=1; i<=NF; i++) {
+                  if ($i ~ /^Package: /)  p=substr($i, 10)
+                  if ($i ~ /^Filename: /) f=substr($i, 11)
+                }
+                if (p == pkg && f != "") {
+                  print f
+                  exit
+                }
+              }
+            ' tmp/Packages
+          }
+
+          download_with_retry() {
+            local url="$1"
+            local out="$2"
+            curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+              -o "$out" "$url"
+          }
+
+          for pkg in "${PKGS[@]}"; do
+            filename="$(awk_get_filename "$pkg" || true)"
+            if [ -z "${filename:-}" ]; then
+              echo "ERROR: package not found in SourceForge index: $pkg"
+              exit 1
+            fi
+
+            echo "Downloading $filename"
+            download_with_retry \
+              "${PKG_BASE_URL}/$(basename "$filename")/download" \
+              "output/ipk/$(basename "$filename")"
+          done
+
+      - name: Prepare OpenWrt SDK
+        run: |
+          set -euo pipefail
+
+          SDK_FILE="openwrt-sdk-${OPENWRT_VERSION}.0-${{ matrix.sdk_target }}-${{ matrix.sdk_subtarget }}_${{ matrix.sdk_arch_suffix }}.Linux-x86_64.tar.zst"
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}.0/targets/${{ matrix.sdk_target }}/${{ matrix.sdk_subtarget }}/${SDK_FILE}"
+
+          wget -O tmp/sdk.tar.zst "${SDK_URL}"
+          tar --zstd -xf tmp/sdk.tar.zst
+          SDK_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
+          echo "SDK_DIR=${SDK_DIR}" >> "$GITHUB_ENV"
+
+      - name: Update feeds and clone helloworld
+        working-directory: ${{ env.SDK_DIR }}
+        run: |
+          set -euo pipefail
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          rm -rf package/helloworld
+          git clone --depth=1 https://github.com/fw876/helloworld.git package/helloworld
+
+      - name: Generate .config for SSR Plus
+        working-directory: ${{ env.SDK_DIR }}
+        run: |
+          set -euo pipefail
+
+          cat > .config <<'EOF'
+          CONFIG_ALL_NONSHARED=y
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=y
+
+          CONFIG_PACKAGE_lua-neturl=m
+          CONFIG_PACKAGE_luci-app-ssr-plus=m
+
+          CONFIG_PACKAGE_luci-app-ssr-plus_Nftables_Transparent_Proxy=y
+
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_ChinaDNS_NG=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_DNS2SOCKS=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Hysteria=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Tuic_Client=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadow_TLS=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_IPT2Socks=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NaiveProxy=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Rust_Client=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Rust_Server=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_Simple_Obfs=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Shadowsocks_V2ray_Plugin=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_ShadowsocksR_Libev_Client=y
+          CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Trojan=y
+          EOF
+
+          make defconfig
+
+      - name: Build SSR Plus packages
+        working-directory: ${{ env.SDK_DIR }}
+        run: |
+          set -euo pipefail
+
+          FAILED_PKGS=""
+
+          for p in lua-neturl luci-app-ssr-plus; do
+            echo "===== Building package/$p ====="
+            if ! make "package/$p/compile" V=s -j"$(nproc)"; then
+              echo "Retrying $p with -j1 ..."
+              if ! make "package/$p/compile" V=s -j1; then
+                echo "FAILED: $p"
+                FAILED_PKGS="$FAILED_PKGS $p"
+              fi
+            fi
+          done
+
+          if [ -n "$FAILED_PKGS" ]; then
+            echo "The following packages failed:$FAILED_PKGS"
+            exit 1
+          fi
+
+      - name: Collect compiled SSR Plus ipks
+        working-directory: ${{ env.SDK_DIR }}
+        run: |
+          set -euo pipefail
+
+          find bin -type f \( -name "lua-neturl*.ipk" -o -name "luci-app-ssr-plus*.ipk" \) \
+            -exec cp -fv {} "${GITHUB_WORKSPACE}/output/ipk/" \;
+
+      - name: Verify required packages
+        run: |
+          set -euo pipefail
+
+          required_patterns=(
+            "luci-app-ssr-plus_*.ipk"
+            "lua-neturl_*.ipk"
+            "xray-core_*.ipk"
+            "chinadns-ng_*.ipk"
+            "dns2socks_*.ipk"
+            "microsocks_*.ipk"
+            "ipt2socks_*.ipk"
+          )
+
+          for pattern in "${required_patterns[@]}"; do
+            if ! compgen -G "output/ipk/${pattern}" > /dev/null; then
+              echo "ERROR: required package missing: ${pattern}"
+              ls -lah output/ipk || true
+              exit 1
+            fi
+          done
+
+      - name: Show downloaded files
+        run: |
+          ls -lah output/ipk
+
+      - name: Make .run package
+        run: |
+          set -euo pipefail
+          chmod +x scripts/install.sh scripts/make-run.sh
+
+          bash scripts/make-run.sh \
+            "ssrplus-full" \
+            "${OPENWRT_VERSION}" \
+            "${{ matrix.arch_label }}" \
+            "${SSRPLUS_VERSION}" \
+            "${GITHUB_WORKSPACE}/output/ipk"
+
+      - name: Verify run package exists
+        run: |
+          set -euo pipefail
+          compgen -G "output/run/*.run" > /dev/null || {
+            echo "ERROR: no .run file generated"
+            exit 1
+          }
+          ls -lah output/run
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssrplus-${{ matrix.arch_label }}
+          path: output/run/*.run
+
+  release:
+    needs:
+      - check-update
+      - build
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show files
+        run: |
+          find dist -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-update.outputs.release_tag }}
+          name: SSR Plus ${{ needs.check-update.outputs.ssrplus_version }} for OpenWrt ${{ env.OPENWRT_VERSION }}
+          files: dist/**/*.run
