@@ -3,35 +3,96 @@ name: Build SSR Plus .run
 on:
   workflow_dispatch:
     inputs:
+      force_build:
+        description: "Force build even if current SSR Plus version is already built"
+        required: false
+        default: "false"
       package_version:
-        description: "包版本目录"
+        description: "Package directory version"
         required: false
         default: "packages-24.10"
 
+permissions:
+  contents: write
+
+env:
+  PACKAGE_VERSION: "packages-24.10"
+
 jobs:
-  build:
+  check-update:
     runs-on: ubuntu-22.04
-
+    outputs:
+      build_needed: ${{ steps.check.outputs.build_needed }}
+      ssrplus_version: ${{ steps.check.outputs.ssrplus_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      package_version: ${{ steps.check.outputs.package_version }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create directories and set PACKAGE_VERSION
+      - name: Check latest helloworld commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
         run: |
           set -euo pipefail
 
-          mkdir -p x86_64/depends aarch64_generic/depends
-
-          package_version="${{ github.event.inputs.package_version }}"
-          if [ -z "$package_version" ]; then
-            package_version="packages-24.10"
+          PACKAGE_VERSION="${{ github.event.inputs.package_version }}"
+          if [ -z "${PACKAGE_VERSION}" ]; then
+            PACKAGE_VERSION="packages-24.10"
           fi
 
-          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+          SSRPLUS_VERSION="$(gh api repos/fw876/helloworld/commits/master --jq '.sha' | cut -c1-7)"
+          RELEASE_TAG="build-ssrplus-${SSRPLUS_VERSION}"
 
-      - name: Download ipk files for x86_64 and aarch64_generic
+          BUILD_NEEDED="true"
+          if [ "${FORCE_BUILD}" != "true" ]; then
+            if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+              BUILD_NEEDED="false"
+            fi
+          fi
+
+          echo "ssrplus_version=${SSRPLUS_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "build_needed=${BUILD_NEEDED}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-update
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: x86_64
+            base_url: "https://dl.openwrt.ai/packages-24.10/x86_64"
+          - arch_label: aarch64_generic
+            base_url: "https://dl.openwrt.ai/packages-24.10/aarch64_generic"
+
+    env:
+      SSRPLUS_VERSION: ${{ needs.check-update.outputs.ssrplus_version }}
+      PACKAGE_VERSION: ${{ needs.check-update.outputs.package_version }}
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl wget jq gzip makeself gh ca-certificates
+
+      - name: Prepare directories
         run: |
           set -euo pipefail
+          rm -rf output tmp work
+          mkdir -p output/ipk output/run tmp work/depends
+
+      - name: Download prebuilt ipks from dl.openwrt.ai
+        run: |
+          set -euo pipefail
+
+          K_BASE="${{ matrix.base_url }}/kiddin9/"
+          P_BASE="${{ matrix.base_url }}/packages/"
 
           FILE_PREFIXES=(
             "shadowsocks-libev-ss-server"
@@ -64,13 +125,12 @@ jobs:
             "luci-app-naiveproxy"
             "luci-app-redsocks2"
             "luci-app-shadowsocks"
+            "luci-app-trojan-server"
           )
 
           download_from_dir() {
             local base_url="$1"
             local out_dir="$2"
-
-            echo "Fetching directory page from $base_url"
 
             wget -qO- "$base_url" | while IFS= read -r line; do
               for prefix in "${FILE_PREFIXES[@]}"; do
@@ -89,7 +149,6 @@ jobs:
                   done
 
                   if $exclude_file; then
-                    echo "Skip file: $file"
                     continue
                   fi
 
@@ -101,124 +160,170 @@ jobs:
               done
             done
           }
-
-          BASE_URL_X86="https://dl.openwrt.ai/${PACKAGE_VERSION}/x86_64/kiddin9/"
-          BASE_URL_ARM="https://dl.openwrt.ai/${PACKAGE_VERSION}/aarch64_generic/kiddin9/"
-
-          download_from_dir "$BASE_URL_X86" "x86_64/depends"
-          download_from_dir "$BASE_URL_ARM" "aarch64_generic/depends"
-
-      - name: Download libudns ipk
-        run: |
-          set -euo pipefail
-
-          FILE_PREFIXES=("libudns")
 
           download_from_packages_dir() {
             local base_url="$1"
             local out_dir="$2"
 
             wget -qO- "$base_url" | while IFS= read -r line; do
-              for prefix in "${FILE_PREFIXES[@]}"; do
-                if [[ "$line" == *"$prefix"* ]]; then
-                  file=$(echo "$line" | grep -oP 'href="\K[^"]*' || true)
-                  if [[ -z "${file:-}" ]]; then
-                    continue
-                  fi
-
-                  file_url="${base_url}${file}"
-                  echo "Downloading: $file_url"
-                  curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
-                    "$file_url" -o "${out_dir}/$(basename "$file_url")"
+              if [[ "$line" == *"libudns"* ]]; then
+                file=$(echo "$line" | grep -oP 'href="\K[^"]*' || true)
+                if [[ -z "${file:-}" ]]; then
+                  continue
                 fi
-              done
+
+                file_url="${base_url}${file}"
+                echo "Downloading: $file_url"
+                curl -L --fail --retry 5 --retry-delay 3 --connect-timeout 20 \
+                  "$file_url" -o "${out_dir}/$(basename "$file_url")"
+              fi
             done
           }
 
-          BASE_URL_X86="https://dl.openwrt.ai/${PACKAGE_VERSION}/x86_64/packages/"
-          BASE_URL_ARM="https://dl.openwrt.ai/${PACKAGE_VERSION}/aarch64_generic/packages/"
+          download_from_dir "$K_BASE" "work/depends"
+          download_from_packages_dir "$P_BASE" "work/depends"
 
-          download_from_packages_dir "$BASE_URL_X86" "x86_64/depends"
-          download_from_packages_dir "$BASE_URL_ARM" "aarch64_generic/depends"
-
-      - name: List depends ipks
+      - name: Organize SSR Plus package files
         run: |
           set -euo pipefail
 
-          echo "List x86 depends ipk files"
-          rm -f x86_64/depends/luci-app-trojan-server* || true
-          ls -lh x86_64/depends/
+          mv work/depends/luci-app-ssr-plus*.ipk work/ || true
 
-          echo "List aarch64_generic depends ipk files"
-          rm -f aarch64_generic/depends/luci-app-trojan-server* || true
-          ls -lh aarch64_generic/depends/
+          shopt -s nullglob
+          root_files=(work/luci-app-ssr-plus*.ipk)
+          dep_files=(work/depends/*.ipk)
+          shopt -u nullglob
 
-          mv x86_64/depends/luci-app-ssr-plus*.ipk x86_64/
-          mv aarch64_generic/depends/luci-app-ssr-plus*.ipk aarch64_generic/
-
-          echo "查看 aarch64_generic 目录"
-          ls -lah aarch64_generic/
-          echo "查看 x86_64 目录"
-          ls -lah x86_64/
-
-      - name: Parse version from filename
-        run: |
-          set -euo pipefail
-
-          for file in aarch64_generic/luci-app-ssr-plus*.ipk; do
-            base=${file##*/}
-            tmp=${base#*_}
-            tmp=${tmp%_all.ipk}
-            version=${tmp/-/_}
-            echo "ssrp_version=$version" >> "$GITHUB_ENV"
-            echo "版本号是：$version"
-            break
-          done
-
-      - name: Create install.sh
-        run: |
-          set -euo pipefail
-
-          cat > x86_64/install.sh <<'EOF'
-          #!/bin/sh
-
-          opkg update
-          if [ $? -ne 0 ]; then
-            echo "update failed"
+          if [ ${#root_files[@]} -eq 0 ]; then
+            echo "ERROR: luci-app-ssr-plus ipk not found"
             exit 1
           fi
 
-          opkg install depends/*.ipk --force-depends
-          opkg install *.ipk --force-depends
+          if [ ${#dep_files[@]} -eq 0 ]; then
+            echo "ERROR: dependency ipks not found"
+            exit 1
+          fi
+
+          cp -av work/depends/*.ipk output/ipk/
+          cp -av work/luci-app-ssr-plus*.ipk output/ipk/
+
+      - name: Parse version from luci-app-ssr-plus filename
+        id: parse_version
+        run: |
+          set -euo pipefail
+
+          file="$(basename "$(ls output/ipk/luci-app-ssr-plus*.ipk | head -n 1)")"
+          tmp="${file#*_}"
+          tmp="${tmp%_all.ipk}"
+          ssrp_version="${tmp//-/_}"
+
+          echo "ssrp_version=${ssrp_version}" >> "$GITHUB_OUTPUT"
+          echo "Parsed SSR Plus package version: ${ssrp_version}"
+
+      - name: Verify required packages
+        run: |
+          set -euo pipefail
+
+          required_patterns=(
+            "luci-app-ssr-plus_*.ipk"
+            "lua-neturl_*.ipk"
+            "xray-core_*.ipk"
+            "chinadns-ng_*.ipk"
+            "dns2socks_*.ipk"
+            "microsocks_*.ipk"
+            "ipt2socks_*.ipk"
+            "libudns_*.ipk"
+          )
+
+          for pattern in "${required_patterns[@]}"; do
+            if ! compgen -G "output/ipk/${pattern}" > /dev/null; then
+              echo "ERROR: required package missing: ${pattern}"
+              ls -lah output/ipk || true
+              exit 1
+            fi
+          done
+
+      - name: Create install.sh for SSR Plus
+        run: |
+          set -euo pipefail
+
+          cat > output/install.sh <<'EOF'
+          #!/bin/sh
+          set -e
+
+          opkg update || true
+
+          if ls /tmp/ssrplus_pkg/depends/*.ipk >/dev/null 2>&1; then
+            opkg install /tmp/ssrplus_pkg/depends/*.ipk --force-depends || true
+          fi
+
+          if ls /tmp/ssrplus_pkg/*.ipk >/dev/null 2>&1; then
+            opkg install /tmp/ssrplus_pkg/*.ipk --force-depends || true
+          fi
+
+          echo "SSR Plus install finished."
           EOF
 
-          chmod +x x86_64/install.sh
-          cp x86_64/install.sh aarch64_generic/install.sh
+          chmod +x output/install.sh
 
-      - name: Clone makeself repo
-        run: |
-          set -euo pipefail
-          git clone https://github.com/megastep/makeself.git
-
-      - name: Move package folders into makeself
-        run: |
-          set -euo pipefail
-          mv -f x86_64/ makeself/
-          mv -f aarch64_generic/ makeself/
-          ls -lah makeself/
-
-      - name: Create self-extracting archives
+      - name: Prepare files for makeself
         run: |
           set -euo pipefail
 
-          cd makeself
-          ./makeself.sh x86_64/ ssrp_x86_64-${ssrp_version}.run "by github action" ./install.sh
-          ./makeself.sh aarch64_generic/ ssrp_aarch64_generic-${ssrp_version}.run "by github action" ./install.sh
+          rm -rf output/build-run
+          mkdir -p output/build-run/depends
 
-      - name: Upload all .run files to GitHub Release
+          cp -av output/ipk/luci-app-ssr-plus*.ipk output/build-run/
+          find output/ipk -type f ! -name 'luci-app-ssr-plus*.ipk' -exec cp -av {} output/build-run/depends/ \;
+          cp -av output/install.sh output/build-run/install.sh
+
+      - name: Make .run package
+        run: |
+          set -euo pipefail
+
+          RUN_NAME="ssrplus-${{ matrix.arch_label }}-${{ steps.parse_version.outputs.ssrp_version }}.run"
+
+          makeself \
+            --nox11 \
+            output/build-run \
+            output/run/${RUN_NAME} \
+            "SSR Plus ${{ steps.parse_version.outputs.ssrp_version }} for ${{ matrix.arch_label }}" \
+            ./install.sh
+
+      - name: Verify run package exists
+        run: |
+          set -euo pipefail
+          compgen -G "output/run/*.run" > /dev/null || {
+            echo "ERROR: no .run file generated"
+            exit 1
+          }
+          ls -lah output/run
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssrplus-${{ matrix.arch_label }}
+          path: output/run/*.run
+
+  release:
+    needs:
+      - check-update
+      - build
+    if: needs.check-update.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show files
+        run: |
+          find dist -type f | sort
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "ShadowsocksPlusPlus"
-          name: SSRP-${{ env.ssrp_version }}
-          files: makeself/*.run
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.check-update.outputs.release_tag }}
+          name: SSR Plus ${{ needs.check-update.outputs.ssrplus_version }}
+          files: dist/**/*.run
